@@ -1,0 +1,53 @@
+{
+  "doc_s2_001": [
+    {
+      "id": "doc_s2_001_chk_0001",
+      "documentId": "doc_s2_001",
+      "userId": "student_test",
+      "notebookId": "nb_pdf_test",
+      "chunkIndex": 1,
+      "pageStart": 1,
+      "pageEnd": 1,
+      "section": "Unit 1: Relational Model",
+      "heading": "Unit 1: Relational Model",
+      "text": "Unit 1: Relational Model\nPage 1: Normalization Rules\nDefinition: X -> Y functional dependency.\nSection 1.1: First Normal Form",
+      "tokenEstimate": 32,
+      "extractionMethod": "text",
+      "sourceDocName": "DBMS_Normalization_Unit1.pdf"
+    }
+  ],
+  "doc_s3_002": [
+    {
+      "id": "doc_s3_002_chk_0001",
+      "documentId": "doc_s3_002",
+      "userId": "student_test",
+      "notebookId": "nb_pdf_test",
+      "chunkIndex": 1,
+      "pageStart": 1,
+      "pageEnd": 1,
+      "section": "Unit 2: Transactions",
+      "heading": "Unit 2: Transactions",
+      "text": "Unit 2: Transactions\nPage 1: ACID Properties\nAtomicity and Durability using WAL.",
+      "tokenEstimate": 20,
+      "extractionMethod": "text",
+      "sourceDocName": "DBMS_Transactions_Unit2.pdf"
+    }
+  ],
+  "doc_s8_003": [
+    {
+      "id": "doc_s8_003_chk_0001",
+      "documentId": "doc_s8_003",
+      "userId": "student_test",
+      "notebookId": "nb_pdf_test",
+      "chunkIndex": 1,
+      "pageStart": 1,
+      "pageEnd": 1,
+      "section": "Unit 3: B+ Trees",
+      "heading": "Unit 3: B+ Trees",
+      "text": "Unit 3: B+ Trees\nPage 1: Leaf node chains and range queries.",
+      "tokenEstimate": 15,
+      "extractionMethod": "text",
+      "sourceDocName": "DBMS_Indexing_Unit3.pdf"
+    }
+  ]
+}
