@@ -56,77 +56,73 @@ export const SmartSummaryModal: React.FC<SmartSummaryModalProps> = ({
   // Load chat and summaries when modal opens or notebook changes
   useEffect(() => {
     if (!isOpen || !notebook) return;
+    let active = true;
 
     setChatError(null);
 
-    // Load chat messages for the current notebook
-    const messages = apiService.getChatMessages(notebook.id);
-    setChatMessages(messages);
+    const loadSummaries = async () => {
+      let messages = apiService.getChatMessages(notebook.id);
+      if (messages.length === 0) {
+        try {
+          messages = await apiService.fetchChatMessages(notebook.id);
+        } catch {
+          // keep empty if fetch fails
+        }
+      }
+      if (!active) return;
+      setChatMessages(messages);
 
-    // 1. Load Chat Summary
-    const cachedChat = apiService.getNotebookChatSummary(notebook.id);
-    if (cachedChat) {
-      setChatSummary(cachedChat);
-    } else if (messages.length > 0) {
-      // Auto-generate if conversations exist and no summary has been created yet
-      handleGenerateChatSummary(false, messages);
-    } else {
-      setChatSummary({
-        notebookId: notebook.id,
-        notebookTitle: notebook.title,
-        summary: `> **No Chat History Available**\n\nYou haven't started a conversation in **${notebook.title}** yet. Ask questions in the AI Tutor chat workspace to build your study dialogue, and generate a comprehensive conversation summary anytime!`,
-        generatedAt: new Date().toLocaleString(),
-        messageCount: 0,
-        hasChat: false,
-      });
-    }
+      // Load cached in-memory summaries first
+      const cachedChat = apiService.getNotebookChatSummary(notebook.id);
+      if (cachedChat) {
+        setChatSummary(cachedChat);
+      }
 
-    // 2. Load Document Summaries from localStorage
-    const cachedDocs = apiService.getAllDocumentSummaries(notebook.id);
-    setDocSummaries(cachedDocs);
+      const cachedDocs = apiService.getAllDocumentSummaries(notebook.id);
+      setDocSummaries(cachedDocs);
 
-    // 3. Sync from backend summaries API for fresh data
-    const uid = apiService.getActiveUserId();
-    const userQuery = uid && uid !== 'guest' ? `?userId=${encodeURIComponent(uid)}` : '';
-    fetch(`/api/summary/notebook/${encodeURIComponent(notebook.id)}${userQuery}`)
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!data) return;
-        if (data.chatSummary && (!cachedChat || new Date(data.chatSummary.generatedAt) > new Date(cachedChat.generatedAt))) {
-          const syncedChat: NotebookChatSummary = {
+      // Sync persisted summaries from PostgreSQL backend with Bearer token
+      try {
+        const synced = await apiService.fetchNotebookSummaries(notebook.id);
+        if (!active) return;
+
+        if (synced.chatSummary) {
+          setChatSummary(synced.chatSummary);
+        } else if (messages.length > 0 && !cachedChat) {
+          handleGenerateChatSummary(false, messages);
+        } else if (!cachedChat) {
+          setChatSummary({
             notebookId: notebook.id,
             notebookTitle: notebook.title,
-            summary: data.chatSummary.summary,
-            generatedAt: data.chatSummary.generatedAt,
-            messageCount: data.chatSummary.messageCount || messages.length,
-            hasChat: true,
-          };
-          setChatSummary(syncedChat);
-          apiService.saveNotebookChatSummary(syncedChat);
+            summary: `> **No Chat History Available**\n\nYou haven't started a conversation in **${notebook.title}** yet. Ask questions in the AI Tutor chat workspace to build your study dialogue, and generate a comprehensive conversation summary anytime!`,
+            generatedAt: new Date().toLocaleString(),
+            messageCount: 0,
+            hasChat: false,
+          });
         }
-        if (Array.isArray(data.documentSummaries) && data.documentSummaries.length > 0) {
+
+        if (synced.documentSummaries.length > 0) {
           setDocSummaries((prev) => {
             const updated = { ...prev };
-            data.documentSummaries.forEach((d: any) => {
-              updated[d.documentId] = {
-                documentId: d.documentId,
-                notebookId: d.notebookId,
-                fileName: d.originalFileName,
-                summary: d.summary,
-                generatedAt: d.generatedAt,
-                pageCount: d.pageCount,
-                fileSize: d.fileSize,
-                status: 'completed',
-              };
-              apiService.saveDocumentSummary(updated[d.documentId]);
+            synced.documentSummaries.forEach((docSum) => {
+              updated[docSum.documentId] = docSum;
             });
             return updated;
           });
         }
-      })
-      .catch((err) => {
+      } catch (err) {
         console.warn('Syncing summaries from backend notice:', err);
-      });
+        if (messages.length > 0 && !cachedChat) {
+          handleGenerateChatSummary(false, messages);
+        }
+      }
+    };
+
+    loadSummaries();
+
+    return () => {
+      active = false;
+    };
   }, [isOpen, notebook.id]);
 
   if (!isOpen) return null;

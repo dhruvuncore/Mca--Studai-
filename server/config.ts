@@ -1,4 +1,15 @@
+import 'dotenv/config';
 import path from 'path';
+
+function normalizeSupabaseOrigin(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || !/^https?:\/\//i.test(trimmed)) return '';
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return '';
+  }
+}
 
 export const config = {
   // Port & Host
@@ -17,23 +28,44 @@ export const config = {
     'image/webp',
     'application/msword',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'application/octet-stream', // some browsers send pdf, doc, or raw files as octet-stream
   ],
 
-  // Storage directories (Use /tmp on Vercel serverless where root filesystem is read-only)
+  // Temporary local scratch directories (used only for transient temp files if needed)
   DATA_DIR: process.env.VERCEL ? '/tmp/data' : path.resolve(process.cwd(), 'data'),
   STORAGE_DIR: process.env.VERCEL ? '/tmp/data/storage' : path.resolve(process.cwd(), 'data', 'storage'),
   VECTOR_DB_DIR: process.env.VERCEL ? '/tmp/data/vectordb' : path.resolve(process.cwd(), 'data', 'vectordb'),
   DB_DIR: process.env.VERCEL ? '/tmp/data/db' : path.resolve(process.cwd(), 'data', 'db'),
 
-  // RAG Chunking configuration (Configurable as per requirement #12, #14, #44)
-  CHUNK_SIZE_TOKENS: 650, // 500-800 tokens
-  CHUNK_OVERLAP_TOKENS: 120, // 15-20% overlap
+  // Supabase Persistence & Storage (supports both new sb_publishable_/sb_secret_ keys and legacy JWT keys)
+  SUPABASE_URL:
+    normalizeSupabaseOrigin(process.env.SUPABASE_URL || '') ||
+    normalizeSupabaseOrigin(process.env.VITE_SUPABASE_URL || ''),
+  SUPABASE_ANON_KEY: (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim(),
+  SUPABASE_SERVICE_ROLE_KEY: (
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SECRET_KEY ||
+    ''
+  ).trim(),
+  SUPABASE_STORAGE_BUCKET: (process.env.SUPABASE_STORAGE_BUCKET || 'studyai-documents').trim(),
+  DATABASE_URL: (process.env.DATABASE_URL || '').trim(),
+
+  // QStash Queue (Free-tier compatible background job queue for Vercel)
+  QSTASH_TOKEN: (process.env.QSTASH_TOKEN || '').trim(),
+  QSTASH_CURRENT_SIGNING_KEY: (process.env.QSTASH_CURRENT_SIGNING_KEY || '').trim(),
+  QSTASH_NEXT_SIGNING_KEY: (process.env.QSTASH_NEXT_SIGNING_KEY || '').trim(),
+  APP_URL: (
+    process.env.APP_URL ||
+    (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '')
+  ).trim(),
+
+  // RAG Chunking configuration
+  CHUNK_SIZE_TOKENS: 650,
+  CHUNK_OVERLAP_TOKENS: 120,
   MIN_CHUNK_CHAR_LENGTH: 30,
 
-  // Retrieval configuration - Deep coverage for handwritten notes & textbooks
+  // Retrieval configuration
   TOP_K: 5,
-  SIMILARITY_THRESHOLD: 0.30, // Optimized to prevent dropping relevant handwritten notes
+  SIMILARITY_THRESHOLD: 0.30,
   MAX_CONTEXT_TOKENS: 3500,
 
   // Embedding & LLM

@@ -1,9 +1,9 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { ExtractedPage } from '../db/models';
 import { ocrService } from './ocrService';
 
-// Safe dynamic loader for PDFParse that works in both ESM development and CommonJS bundled builds
 const getPDFParse = (): any => {
   try {
     if (typeof require === 'function') {
@@ -53,38 +53,42 @@ const getWordExtractor = (): any => {
 };
 
 export class PDFExtractor {
-  /**
-   * Extracts content page-by-page from a PDF, Word document (.docx, .doc), image, or text file.
-   * Handles handwritten notebooks, scanned textbooks, photos of notes, Word docs, and standard PDFs.
-   */
   async extractPages(filePath: string, originalFileName: string): Promise<ExtractedPage[]> {
-    const ext = path.extname(filePath).toLowerCase();
+    const buffer = fs.readFileSync(filePath);
+    return this.extractPagesFromBuffer(buffer, originalFileName);
+  }
+
+  /**
+   * Extracts content page-by-page directly from an in-memory Buffer
+   * (compatible with Supabase Storage downloads and serverless execution).
+   */
+  async extractPagesFromBuffer(dataBuffer: Buffer, originalFileName: string): Promise<ExtractedPage[]> {
+    const ext = path.extname(originalFileName).toLowerCase();
 
     if (ext === '.txt' || ext === '.md') {
-      return this.extractFromTextFile(filePath);
+      return this.extractFromTextBuffer(dataBuffer);
     }
 
     if (ext === '.docx') {
-      return this.extractFromDocx(filePath, originalFileName);
+      return this.extractFromDocxBuffer(dataBuffer, originalFileName);
     }
 
     if (ext === '.doc') {
-      return this.extractFromDoc(filePath, originalFileName);
+      return this.extractFromDocBuffer(dataBuffer, originalFileName);
     }
 
     if (['.png', '.jpg', '.jpeg', '.webp'].includes(ext)) {
-      return this.extractFromImageFile(filePath, originalFileName, ext);
+      return this.extractFromImageBuffer(dataBuffer, originalFileName, ext);
     }
 
-    return this.extractFromPDF(filePath, originalFileName);
+    return this.extractFromPDFBuffer(dataBuffer, originalFileName);
   }
 
-  private async extractFromTextFile(filePath: string): Promise<ExtractedPage[]> {
-    const content = fs.readFileSync(filePath, 'utf-8');
+  private async extractFromTextBuffer(dataBuffer: Buffer): Promise<ExtractedPage[]> {
+    const content = dataBuffer.toString('utf-8');
     const lines = content.split('\n');
     const pages: ExtractedPage[] = [];
 
-    // Chunk text files into virtual pages of ~45 lines each
     const linesPerPage = 45;
     let currentPageNum = 1;
 
@@ -112,12 +116,11 @@ export class PDFExtractor {
     return pages;
   }
 
-  private async extractFromImageFile(
-    filePath: string,
+  private async extractFromImageBuffer(
+    dataBuffer: Buffer,
     originalFileName: string,
     ext: string
   ): Promise<ExtractedPage[]> {
-    const dataBuffer = fs.readFileSync(filePath);
     const mimeMap: Record<string, string> = {
       '.png': 'image/png',
       '.jpg': 'image/jpeg',
@@ -150,11 +153,7 @@ export class PDFExtractor {
     ];
   }
 
-  /**
-   * Extracts text from Modern Microsoft Word DOCX files using Mammoth.
-   * Converts formatting, headings (#, ##), and bullet lists into markdown structure.
-   */
-  private async extractFromDocx(filePath: string, originalFileName: string): Promise<ExtractedPage[]> {
+  private async extractFromDocxBuffer(dataBuffer: Buffer, originalFileName: string): Promise<ExtractedPage[]> {
     try {
       const mammothMod = getMammoth();
       if (!mammothMod) {
@@ -163,14 +162,14 @@ export class PDFExtractor {
 
       let text = '';
       try {
-        const mdResult = await mammothMod.convertToMarkdown({ path: filePath });
+        const mdResult = await mammothMod.convertToMarkdown({ buffer: dataBuffer });
         text = mdResult?.value?.trim() || '';
       } catch (e) {
         console.warn('Docx markdown conversion note:', e);
       }
 
       if (!text) {
-        const rawResult = await mammothMod.extractRawText({ path: filePath });
+        const rawResult = await mammothMod.extractRawText({ buffer: dataBuffer });
         text = rawResult?.value?.trim() || '';
       }
 
@@ -181,19 +180,17 @@ export class PDFExtractor {
       console.warn(`Docx primary extraction failed for ${originalFileName}, trying word-extractor fallback:`, err);
     }
 
-    // Fallback: try word-extractor in case file is binary doc with .docx extension
-    return this.extractFromDoc(filePath, originalFileName);
+    return this.extractFromDocBuffer(dataBuffer, originalFileName);
   }
 
-  /**
-   * Extracts text from Legacy Word DOC files (Word 97-2004) using WordExtractor.
-   */
-  private async extractFromDoc(filePath: string, originalFileName: string): Promise<ExtractedPage[]> {
+  private async extractFromDocBuffer(dataBuffer: Buffer, originalFileName: string): Promise<ExtractedPage[]> {
+    const tmpPath = path.join(os.tmpdir(), `studyai_doc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.doc`);
     try {
+      fs.writeFileSync(tmpPath, dataBuffer);
       const WordExtractorMod = getWordExtractor();
       if (WordExtractorMod) {
         const extractor = new WordExtractorMod();
-        const extracted = await extractor.extract(filePath);
+        const extracted = await extractor.extract(tmpPath);
         const body = extracted?.getBody()?.trim() || '';
         if (body && body.length > 0) {
           return this.paginateTextContent(body, originalFileName);
@@ -201,13 +198,16 @@ export class PDFExtractor {
       }
     } catch (err) {
       console.warn(`WordExtractor failed for ${originalFileName}:`, err);
+    } finally {
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {}
     }
 
-    // Secondary fallback: Try mammoth in case it's actually docx with .doc extension
     try {
       const mammothMod = getMammoth();
       if (mammothMod) {
-        const rawResult = await mammothMod.extractRawText({ path: filePath });
+        const rawResult = await mammothMod.extractRawText({ buffer: dataBuffer });
         const text = rawResult?.value?.trim() || '';
         if (text && text.length > 0) {
           return this.paginateTextContent(text, originalFileName);
@@ -215,7 +215,6 @@ export class PDFExtractor {
       }
     } catch {}
 
-    // Fallback page
     return [
       {
         pageNumber: 1,
@@ -256,13 +255,9 @@ export class PDFExtractor {
     return pages;
   }
 
-  /**
-   * Detects physical page count from raw PDF binary header/catalog
-   */
   private detectPDFPageCount(buffer: Buffer): number {
     try {
       const binaryString = buffer.toString('binary');
-      // 1. Try to find /Count in /Pages dictionary
       const countMatch = binaryString.match(/\/Type\s*\/Pages[^>]*\/Count\s+(\d+)/i);
       if (countMatch && countMatch[1]) {
         const count = parseInt(countMatch[1], 10);
@@ -271,7 +266,6 @@ export class PDFExtractor {
         }
       }
 
-      // 2. Fallback: Count /Type /Page objects (excluding /Pages)
       const pageMatches = binaryString.match(/\/Type\s*\/Page\b(?!\s*s)/gi);
       if (pageMatches && pageMatches.length > 0) {
         return pageMatches.length;
@@ -282,8 +276,7 @@ export class PDFExtractor {
     return 0;
   }
 
-  private async extractFromPDF(filePath: string, originalFileName: string): Promise<ExtractedPage[]> {
-    const dataBuffer = fs.readFileSync(filePath);
+  private async extractFromPDFBuffer(dataBuffer: Buffer, originalFileName: string): Promise<ExtractedPage[]> {
     const detectedTotalPages = this.detectPDFPageCount(dataBuffer);
     const pagesList: { pageNumber: number; text: string }[] = [];
 
@@ -313,9 +306,7 @@ export class PDFExtractor {
       if (parser && typeof parser.destroy === 'function') {
         try {
           await parser.destroy();
-        } catch {
-          // ignore
-        }
+        } catch {}
       }
     }
 
@@ -323,9 +314,6 @@ export class PDFExtractor {
     const totalTextLength = pagesList.reduce((acc, p) => acc + (p.text?.trim()?.length || 0), 0);
     const avgCharsPerPage = totalTextLength / (targetPageCount || 1);
 
-    // Multimodal whole-document PDF transcription is reserved for genuinely scanned or
-    // handwritten documents (small page count <= 15 and low total text). Digital textbooks or multi-page
-    // documents with existing extracted text should not be sent over inline multimodal API.
     const isSmallDocument = targetPageCount <= 15 && dataBuffer.length <= 8 * 1024 * 1024;
     const isSeverelyEmpty = totalTextLength < 250;
     const lowDensityPagesCount = pagesList.filter((p) => ocrService.isScannedOrLowDensity(p.text)).length;
@@ -335,7 +323,6 @@ export class PDFExtractor {
 
     if (isPredominantlyScanned && dataBuffer.length > 0) {
       try {
-        console.log(`[Handwriting/OCR] Attempting deep transcription for scanned/handwritten document "${originalFileName}" (${targetPageCount} pages, avg ${Math.round(avgCharsPerPage)} chars/page)...`);
         const ocrPages = await ocrService.transcribeScannedPDF(dataBuffer, originalFileName);
         if (ocrPages && ocrPages.length > 0) {
           return ocrPages.map((gp) => ({
@@ -354,31 +341,21 @@ export class PDFExtractor {
       const existingPageNums = new Set(pagesList.map((p) => p.pageNumber));
       for (let i = 1; i <= targetPageCount; i++) {
         if (!existingPageNums.has(i)) {
-          pagesList.push({
-            pageNumber: i,
-            text: '',
-          });
+          pagesList.push({ pageNumber: i, text: '' });
         }
       }
     }
 
-    // If still empty, ensure at least 1 page representation for the file
     if (pagesList.length === 0) {
       const fallbackCount = detectedTotalPages > 0 ? detectedTotalPages : 1;
       for (let i = 1; i <= fallbackCount; i++) {
-        pagesList.push({
-          pageNumber: i,
-          text: '',
-        });
+        pagesList.push({ pageNumber: i, text: '' });
       }
     }
 
-    // Sort pages in ascending order
     pagesList.sort((a, b) => a.pageNumber - b.pageNumber);
 
-    // Run OCR evaluation on each page
     const extractedPages: ExtractedPage[] = [];
-
     for (const p of pagesList) {
       const needsOCR = ocrService.isScannedOrLowDensity(p.text);
       if (needsOCR) {

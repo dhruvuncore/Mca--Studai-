@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, FileText, CheckCircle2, Cpu, Database, BookOpen, Layers, Loader2, Sparkles } from 'lucide-react';
+import { X, FileText, CheckCircle2, Cpu, Database, Loader2, Download } from 'lucide-react';
 import { DocumentItem } from '../types';
 import { apiService } from '../services/apiService';
 
@@ -17,9 +17,12 @@ export const DocumentPreviewModal: React.FC<DocumentPreviewModalProps> = ({
   const [chunks, setChunks] = useState<any[]>([]);
   const [isLoadingChunks, setIsLoadingChunks] = useState<boolean>(false);
   const [selectedChunkIdx, setSelectedChunkIdx] = useState<number>(0);
+  const [isDownloading, setIsDownloading] = useState<boolean>(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isOpen || !document) return;
+    setDownloadError(null);
 
     setIsLoadingChunks(true);
     apiService
@@ -171,13 +174,50 @@ export const DocumentPreviewModal: React.FC<DocumentPreviewModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="p-4 border-t border-slate-200 bg-slate-50/80 rounded-b-2xl flex items-center justify-end">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-200 rounded-lg transition-colors"
-          >
-            Close Preview
-          </button>
+        <div className="p-4 border-t border-slate-200 bg-slate-50/80 rounded-b-2xl flex items-center justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            {downloadError && (
+              <p className="text-[11px] text-rose-600 font-medium truncate">{downloadError}</p>
+            )}
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={isDownloading}
+              onClick={async () => {
+                setIsDownloading(true);
+                setDownloadError(null);
+                try {
+                  const res = await apiService.getDocumentDownloadUrl(document.id);
+                  const anchor = window.document.createElement('a');
+                  anchor.href = res.url;
+                  anchor.download = res.fileName || document.name;
+                  anchor.rel = 'noopener noreferrer';
+                  window.document.body.appendChild(anchor);
+                  anchor.click();
+                  window.document.body.removeChild(anchor);
+                } catch (err: any) {
+                  setDownloadError(err?.message || 'Unable to generate secure download link.');
+                } finally {
+                  setIsDownloading(false);
+                }
+              }}
+              className="px-3.5 py-2 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-60"
+            >
+              {isDownloading ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Download className="w-3.5 h-3.5" />
+              )}
+              <span>{isDownloading ? 'Preparing Link...' : 'Download Original'}</span>
+            </button>
+            <button
+              onClick={onClose}
+              className="px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-200 rounded-lg transition-colors"
+            >
+              Close Preview
+            </button>
+          </div>
         </div>
       </div>
     </div>

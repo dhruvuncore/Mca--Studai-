@@ -1,8 +1,8 @@
-import fs from 'fs';
 import { GoogleGenAI } from '@google/genai';
 import { db, isValidEntityId } from '../db/database';
 import { DocumentChunk, DocumentSummaryRecord, ChatSummaryRecord } from '../db/models';
 import { pdfExtractor } from './pdfExtractor';
+import { storageService } from './storageService';
 import {
   AIServiceError,
   GEMINI_TEXT_MODELS,
@@ -87,10 +87,6 @@ export class SummaryService {
     );
   }
 
-  /**
-   * Generates ONE comprehensive intelligent summary of the entire chat conversation
-   * for the given notebook (Section A).
-   */
   async generateChatSummary(options: {
     notebookId: string;
     userId: string;
@@ -110,9 +106,20 @@ export class SummaryService {
       throw new Error('Valid notebookId and userId are required to generate chat summary.');
     }
 
-    const validHistory = history.filter((m) => m && typeof m.content === 'string' && m.content.trim().length > 0);
+    // Prefer persisted messages in PostgreSQL if caller did not pass full history
+    let sourceHistory = history.filter((m) => m && typeof m.content === 'string' && m.content.trim().length > 0);
+    if (sourceHistory.length === 0) {
+      const dbMessages = await db.getChatMessages(notebookId, userId);
+      sourceHistory = dbMessages
+        .filter((m) => m.text && m.text.trim().length > 0)
+        .map((m) => ({
+          role: m.sender === 'user' ? 'user' : 'assistant',
+          content: m.text,
+          timestamp: m.timestamp,
+        }));
+    }
 
-    if (validHistory.length === 0) {
+    if (sourceHistory.length === 0) {
       return {
         summary: `> **No Chat History Available**\n\nYou haven't started a conversation in **${notebookTitle}** yet. Ask questions in the AI Tutor chat workspace to build your study dialogue, and generate a comprehensive conversation summary anytime!`,
         generatedAt: new Date().toLocaleString(),
@@ -122,10 +129,9 @@ export class SummaryService {
       };
     }
 
-    // Check cache if not forcing regenerate
     if (!forceRegenerate) {
-      const cached = db.getChatSummary(notebookId, userId);
-      if (cached && cached.messageCount === validHistory.length) {
+      const cached = await db.getChatSummary(notebookId, userId);
+      if (cached && cached.messageCount === sourceHistory.length) {
         return {
           summary: cached.summary,
           generatedAt: cached.generatedAt,
@@ -136,7 +142,6 @@ export class SummaryService {
       }
     }
 
-    // Prevent duplicate concurrent requests for the same notebook
     const lockKey = `${userId}:${notebookId}`;
     const existingPromise = this.inFlightChatSummaries.get(lockKey);
     if (existingPromise) {
@@ -146,7 +151,7 @@ export class SummaryService {
     const task = (async () => {
       const client = getGeminiClientOrThrow();
 
-      const transcript = validHistory
+      const transcript = sourceHistory
         .map((msg, idx) => {
           const speaker = msg.role === 'user' ? 'STUDENT QUESTION' : 'AI TUTOR EXPLANATION';
           return `[Turn ${idx + 1} - ${speaker}]:\n${msg.content.trim()}`;
@@ -176,7 +181,7 @@ export class SummaryService {
         `     ## 6. Key Takeaways\n` +
         `   - Use bullet points, bold key terms, and code blocks for schemas/formulas where appropriate.`;
 
-      const prompt = `[FULL CONVERSATION HISTORY - ${validHistory.length} MESSAGES]\n\n${transcript}\n\nPlease generate the comprehensive Smart Chat Summary now:`;
+      const prompt = `[FULL CONVERSATION HISTORY - ${sourceHistory.length} MESSAGES]\n\n${transcript}\n\nPlease generate the comprehensive Smart Chat Summary now:`;
 
       const summaryText = await this.callGeminiWithFallback(client, prompt, systemInstruction, 30000);
 
@@ -186,16 +191,16 @@ export class SummaryService {
         userId,
         summary: summaryText,
         generatedAt,
-        messageCount: validHistory.length,
+        messageCount: sourceHistory.length,
         lastMessageId: `msg_${Date.now()}`,
       };
 
-      db.saveChatSummary(record);
+      await db.saveChatSummary(record);
 
       return {
         summary: summaryText,
         generatedAt,
-        messageCount: validHistory.length,
+        messageCount: sourceHistory.length,
         hasChat: true,
         fromCache: false,
       };
@@ -209,10 +214,6 @@ export class SummaryService {
     }
   }
 
-  /**
-   * Generates a separate Smart Summary for an individual uploaded document (Section B).
-   * Reads all available extracted pages/chunks without omitting sections.
-   */
   async generateDocumentSummary(options: {
     documentId: string;
     notebookId: string;
@@ -233,7 +234,7 @@ export class SummaryService {
       throw new Error('Valid documentId and userId are required.');
     }
 
-    const doc = db.getDocument(documentId);
+    const doc = await db.getDocument(documentId, userId);
     if (!doc) {
       return {
         summary: '> **Document Not Found**\n\nThe requested document record could not be found in the knowledge base.',
@@ -270,12 +271,10 @@ export class SummaryService {
       };
     }
 
-    // Retrieve ALL chunks of this document
-    let chunks = db.getDocumentChunks(documentId);
+    let chunks = await db.getDocumentChunks(documentId, userId);
 
-    // Check cache (invalidate if chunk count changed)
     if (!forceRegenerate) {
-      const cached = db.getDocumentSummary(documentId);
+      const cached = await db.getDocumentSummary(documentId, userId);
       if (
         cached &&
         cached.summary &&
@@ -293,7 +292,6 @@ export class SummaryService {
       }
     }
 
-    // Prevent duplicate concurrent requests for the same document
     const lockKey = `${userId}:${documentId}`;
     const existingPromise = this.inFlightDocSummaries.get(lockKey);
     if (existingPromise) {
@@ -309,10 +307,10 @@ export class SummaryService {
       status: 'completed' | 'error';
       error?: string;
     }> => {
-      // If chunks are empty, attempt direct extraction only if source file exists on disk
-      if (chunks.length === 0 && doc.storagePath && fs.existsSync(doc.storagePath)) {
+      if (chunks.length === 0 && doc.storagePath && !doc.storagePath.startsWith('legacy/')) {
         try {
-          const pages = await pdfExtractor.extractPages(doc.storagePath, doc.originalFileName);
+          const buf = await storageService.downloadBuffer(doc.storagePath);
+          const pages = await pdfExtractor.extractPagesFromBuffer(buf, doc.originalFileName);
           if (pages.length > 0) {
             chunks = pages.map((p, idx) => ({
               id: `${doc.id}_chk_${(idx + 1).toString().padStart(4, '0')}`,
@@ -331,7 +329,7 @@ export class SummaryService {
             }));
           }
         } catch (extractErr) {
-          console.warn('Fallback direct page extraction failed:', extractErr);
+          console.warn('Fallback storage extraction failed:', extractErr);
         }
       }
 
@@ -370,7 +368,7 @@ export class SummaryService {
         sourceChunkCount: chunks.length,
       };
 
-      db.saveDocumentSummary(summaryRecord);
+      await db.saveDocumentSummary(summaryRecord);
 
       return {
         summary: summaryText,
@@ -390,9 +388,6 @@ export class SummaryService {
     }
   }
 
-  /**
-   * Summarizes all chunks of a document with Gemini, handling long documents with multi-section batching.
-   */
   private async generateDocumentSummaryWithGemini(
     client: GoogleGenAI,
     fileName: string,
@@ -437,10 +432,6 @@ export class SummaryService {
     return this.callGeminiWithFallback(client, prompt, systemInstruction, 35000);
   }
 
-  /**
-   * Multi-section hierarchical summarization for long documents (> 25 chunks)
-   * without silently omitting any document sections.
-   */
   private async multiSectionSummarizeWithGemini(
     client: GoogleGenAI,
     fileName: string,

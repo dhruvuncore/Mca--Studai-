@@ -11,10 +11,8 @@ import {
   StudentProfile,
   SourceReference,
 } from '../types';
-import {
-  initialNotebooks,
-  sampleQuestions,
-} from '../mockData';
+import { sampleQuestions } from '../mockData';
+import { getMissingClientEnvVars, getSupabaseClient, isSupabaseClientConfigured } from '../lib/supabase';
 
 export class ApiError extends Error {
   code?: string;
@@ -30,94 +28,176 @@ export class ApiError extends Error {
   }
 }
 
-// Storage keys
 const STORAGE_KEYS = {
-  NOTEBOOKS: 'studyai_notebooks',
-  PROFILE: 'studyai_profile',
-  CHATS: 'studyai_chats',
-  SMART_NOTES: 'studyai_smart_notes',
-  SUMMARY_CHATS: 'studyai_summary_chats',
-  SUMMARY_DOCS: 'studyai_summary_docs',
-  EXAM_RESULTS: 'studyai_exam_results',
-  ACTIVITY: 'studyai_activity',
-  ANALYTICS: 'studyai_analytics',
-  AUTH: 'studyai_auth_token',
-  USERS: 'studyai_registered_users',
   REMEMBER_EMAIL: 'studyai_remembered_email',
 };
 
-export interface StoredUser {
-  id: string;
-  name: string;
-  email: string;
-  password: string;
-  degree: string;
-  semester: string;
-  university: string;
-  avatar: string;
-  createdAt: string;
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 KB';
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const defaultInitialUsers: StoredUser[] = [];
+function formatDateLabel(raw?: string): string {
+  if (!raw) return 'Just now';
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return raw;
+  return parsed.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
+
+function mapServerDocumentToItem(raw: any): DocumentItem {
+  if (!raw) {
+    return {
+      id: '',
+      notebookId: '',
+      name: 'Document',
+      size: '0 KB',
+      pages: 1,
+      uploadDate: 'Just now',
+      status: 'UPLOADED',
+      extractedChunksCount: 0,
+    };
+  }
+
+  const sizeLabel =
+    typeof raw.size === 'string'
+      ? raw.size
+      : formatBytes(Number(raw.fileSize || raw.file_size || 0));
+
+  const pages = Number(raw.pages || raw.totalPages || raw.total_pages || 1);
+  const chunkCount = Number(
+    raw.extractedChunksCount ?? raw.chunkCount ?? raw.chunk_count ?? 0
+  );
+
+  return {
+    id: raw.id,
+    notebookId: raw.notebookId || raw.notebook_id || '',
+    name: raw.name || raw.originalFileName || raw.original_file_name || 'Document',
+    size: sizeLabel,
+    pages,
+    uploadDate: formatDateLabel(raw.uploadDate || raw.upload_date),
+    status: raw.status || 'UPLOADED',
+    extractedChunksCount: chunkCount,
+    currentStage: raw.currentStage || raw.current_stage,
+    progress: typeof raw.progress === 'number' ? raw.progress : undefined,
+    message: raw.message,
+    error: raw.error ?? null,
+    metrics: raw.metrics,
+    previewSnippet:
+      raw.previewSnippet ||
+      (raw.status === 'COMPLETED'
+        ? `Indexed ${chunkCount} vector chunks across ${pages} pages in PostgreSQL + pgvector.`
+        : raw.message || 'Document stored securely in private Supabase Storage.'),
+  };
+}
+
+function mapServerNotebook(raw: any): Notebook {
+  const docs = Array.isArray(raw.documents) ? raw.documents.map(mapServerDocumentToItem) : [];
+  return {
+    id: raw.id,
+    title: raw.title || 'Untitled Notebook',
+    code: raw.code || '',
+    description: raw.description || '',
+    iconName: raw.iconName || raw.icon_name || 'BookOpen',
+    accentColor: raw.accentColor || raw.accent_color || '#2563EB',
+    documentsCount: typeof raw.documentsCount === 'number' ? raw.documentsCount : docs.length,
+    progress: Number(raw.progress || 0),
+    lastStudied: raw.lastStudied || raw.last_studied || 'Just now',
+    documents: docs,
+  };
+}
 
 class ApiService {
+  private accessToken: string | null = null;
+  private profile: StudentProfile | null = null;
+  private notebooks: Notebook[] = [];
+  private chatsByNotebook: Record<string, ChatMessage[]> = {};
+  private chatSummaries: Record<string, NotebookChatSummary> = {};
+  private docSummaries: Record<string, DocumentSummary> = {};
+  private examResults: ExamResult[] = [];
+  private recentActivity: RecentActivityItem[] = [];
+
   constructor() {
-    this.enforceCleanDataWipe();
+    this.scrubLegacyLocalAuthAndData();
   }
 
-  enforceCleanDataWipe(): void {
-    const WIPE_KEY = 'studyai_zero_data_v3';
+  private scrubLegacyLocalAuthAndData(): void {
     try {
-      if (typeof window !== 'undefined' && localStorage.getItem(WIPE_KEY) !== 'purged') {
-        const theme = localStorage.getItem('study_ai_theme');
-        const keysToRemove: string[] = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          if (k && (k.startsWith('studyai_') || (k.startsWith('study_ai_') && k !== 'study_ai_theme'))) {
-            keysToRemove.push(k);
-          }
+      if (typeof window === 'undefined' || !window.localStorage) return;
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (
+          k &&
+          k !== 'study_ai_theme' &&
+          k !== STORAGE_KEYS.REMEMBER_EMAIL &&
+          k !== 'studyai_supabase_auth' &&
+          (k.startsWith('studyai_') || k.startsWith('study_ai_'))
+        ) {
+          keysToRemove.push(k);
         }
-        keysToRemove.forEach((k) => localStorage.removeItem(k));
-        if (theme) {
-          localStorage.setItem('study_ai_theme', theme);
-        }
-        localStorage.setItem(WIPE_KEY, 'purged');
       }
-    } catch (e) {
-      console.warn('Wipe failed:', e);
-    }
-  }
-
-  private getStorage<T>(key: string, fallback: T): T {
-    try {
-      const item = localStorage.getItem(key);
-      return item ? JSON.parse(item) : fallback;
+      keysToRemove.forEach((k) => localStorage.removeItem(k));
     } catch {
-      return fallback;
+      // Ignore storage access errors
     }
   }
 
-  private setStorage<T>(key: string, data: T): void {
-    try {
-      localStorage.setItem(key, JSON.stringify(data));
-    } catch (e) {
-      console.warn('Storage save failed:', e);
-    }
+  private clearInMemoryCaches(): void {
+    this.accessToken = null;
+    this.profile = null;
+    this.notebooks = [];
+    this.chatsByNotebook = {};
+    this.chatSummaries = {};
+    this.docSummaries = {};
+    this.examResults = [];
+    this.recentActivity = [];
   }
 
-  // User Scoping Helpers
-  getActiveUserId(): string {
-    const profile = this.getProfile();
-    return profile?.id || 'guest';
+  private async getValidAccessToken(): Promise<string> {
+    if (!isSupabaseClientConfigured()) {
+      throw new ApiError(
+        'Supabase authentication is not configured. Please add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.',
+        'AUTH_NOT_CONFIGURED',
+        false,
+        503
+      );
+    }
+
+    const supabase = getSupabaseClient();
+    const { data, error } = await supabase.auth.getSession();
+    if (error || !data.session?.access_token) {
+      this.accessToken = null;
+      throw new ApiError('Your session has expired. Please sign in again.', 'AUTH_REQUIRED', false, 401);
+    }
+
+    this.accessToken = data.session.access_token;
+    return this.accessToken;
   }
 
-  requireActiveUserId(): string {
-    const profile = this.getProfile();
-    const uid = profile?.id?.trim();
-    if (!uid || uid === 'guest' || uid === 'student_demo') {
-      throw new ApiError('Please sign in to your StudyAI account to continue.', 'AUTH_REQUIRED', false, 401);
+  async authFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+    const token = await this.getValidAccessToken();
+    const headers = new Headers(init.headers || {});
+    headers.set('Authorization', `Bearer ${token}`);
+
+    let res = await fetch(input, { ...init, headers });
+
+    // If token expired just before request, try one Supabase session refresh
+    if (res.status === 401 && isSupabaseClientConfigured()) {
+      const supabase = getSupabaseClient();
+      const { data: refreshed } = await supabase.auth.refreshSession();
+      if (refreshed.session?.access_token) {
+        this.accessToken = refreshed.session.access_token;
+        headers.set('Authorization', `Bearer ${this.accessToken}`);
+        res = await fetch(input, { ...init, headers });
+      }
     }
-    return uid;
+
+    return res;
   }
 
   private async parseErrorResponse(res: Response, defaultMessage: string): Promise<ApiError> {
@@ -133,7 +213,7 @@ class ApiService {
             : res.status >= 500 || res.status === 408 || res.status === 429;
         return new ApiError(message, code, retryable, res.status);
       } catch {
-        // fall through to default error
+        // fall through
       }
     }
     return new ApiError(
@@ -144,137 +224,226 @@ class ApiService {
     );
   }
 
-  private getUserScopedKey(baseKey: string, customUserId?: string): string {
-    const uid = customUserId || this.getActiveUserId();
-    return `${baseKey}_${uid}`;
-  }
-
-  // Authentication
-  getProfile(): StudentProfile | null {
-    if (!this.isAuthenticated()) {
-      return null;
-    }
-    const profile = this.getStorage<StudentProfile | null>(STORAGE_KEYS.PROFILE, null);
-    if (!profile) {
-      return null;
-    }
-    // Filter out old demo user profile
-    if (profile.id === 'student_001' || profile.email.toLowerCase() === 'alex.sharma@mca.edu') {
-      this.logout();
-      return null;
-    }
-    return profile;
-  }
-
-  updateProfile(profile: Partial<StudentProfile>): StudentProfile {
-    const current = this.getProfile() || {
-      id: 'student_' + Date.now(),
-      name: 'Student',
-      email: 'student@edu.com',
-      avatar: 'ST',
-      degree: 'Master of Computer Applications (MCA)',
-      semester: 'Semester II',
-      university: 'Department of Computer Science',
-    };
-    const updated = { ...current, ...profile };
-    this.setStorage(STORAGE_KEYS.PROFILE, updated);
-
-    // Also update in registered users list
-    const users = this.getRegisteredUsers().map((u) => {
-      if (u.id === updated.id || u.email.toLowerCase() === updated.email.toLowerCase()) {
-        return {
-          ...u,
-          name: updated.name || u.name,
-          degree: updated.degree || u.degree,
-          semester: updated.semester || u.semester,
-          university: updated.university || u.university,
-          avatar: updated.avatar || u.avatar,
-        };
-      }
-      return u;
-    });
-    this.setStorage(STORAGE_KEYS.USERS, users);
-    return updated;
-  }
+  // ============================================================
+  // AUTHENTICATION & SESSION HYDRATION (SUPABASE AUTH)
+  // ============================================================
 
   isAuthenticated(): boolean {
-    return !!localStorage.getItem(STORAGE_KEYS.AUTH);
+    return Boolean(this.accessToken && this.profile);
   }
 
-  getRegisteredUsers(): StoredUser[] {
-    const users = this.getStorage<StoredUser[]>(STORAGE_KEYS.USERS, []);
-    if (!users || !Array.isArray(users)) {
-      return [];
+  getActiveUserId(): string {
+    return this.profile?.id || '';
+  }
+
+  requireActiveUserId(): string {
+    const uid = this.profile?.id?.trim();
+    if (!uid) {
+      throw new ApiError('Please sign in to your StudyAI account to continue.', 'AUTH_REQUIRED', false, 401);
     }
-    // Filter out demo user
-    return users.filter(
-      (u) => u.id !== 'student_001' && u.email.toLowerCase() !== 'alex.sharma@mca.edu'
-    );
+    return uid;
   }
 
-  authenticateUser(
+  getProfile(): StudentProfile | null {
+    return this.profile;
+  }
+
+  async getConfigurationStatus(): Promise<{
+    clientConfigured: boolean;
+    serverConfigured: boolean;
+    missingClientVars: string[];
+    missingServerVars: string[];
+    databaseConnected: boolean;
+  }> {
+    const missingClientVars = getMissingClientEnvVars();
+    const clientConfigured = missingClientVars.length === 0;
+
+    try {
+      const res = await fetch('/api/health');
+      if (res.ok) {
+        const data = await res.json();
+        const missingServerVars = Array.isArray(data.missingServerConfig)
+          ? (data.missingServerConfig as string[])
+          : [];
+        return {
+          clientConfigured,
+          serverConfigured: Boolean(data.supabaseConfigured),
+          missingClientVars,
+          missingServerVars,
+          databaseConnected: Boolean(data.databaseConnected),
+        };
+      }
+    } catch {
+      // Backend health endpoint unreachable; fall back to client configuration check
+    }
+
+    return {
+      clientConfigured,
+      serverConfigured: false,
+      missingClientVars,
+      missingServerVars: [],
+      databaseConnected: false,
+    };
+  }
+
+  async initializeSession(): Promise<StudentProfile | null> {
+    if (!isSupabaseClientConfigured()) {
+      this.clearInMemoryCaches();
+      return null;
+    }
+
+    try {
+      const supabase = getSupabaseClient();
+      const { data, error } = await supabase.auth.getSession();
+      if (error || !data.session?.access_token) {
+        this.clearInMemoryCaches();
+        return null;
+      }
+
+      this.accessToken = data.session.access_token;
+      await this.bootstrapUserData();
+      return this.profile;
+    } catch (err) {
+      console.warn('Session restoration notice:', err);
+      this.clearInMemoryCaches();
+      return null;
+    }
+  }
+
+  subscribeToAuthChanges(onChange: (profile: StudentProfile | null) => void): () => void {
+    if (!isSupabaseClientConfigured()) {
+      return () => {};
+    }
+
+    const supabase = getSupabaseClient();
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (event === 'SIGNED_OUT' || !session?.access_token) {
+        this.clearInMemoryCaches();
+        onChange(null);
+        return;
+      }
+
+      this.accessToken = session.access_token;
+      if (event === 'SIGNED_IN' || event === 'USER_UPDATED' || event === 'INITIAL_SESSION') {
+        try {
+          await this.bootstrapUserData();
+          onChange(this.profile);
+        } catch (err) {
+          console.warn('Auth state sync error:', err);
+        }
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }
+
+  async bootstrapUserData(): Promise<void> {
+    const [meRes, nbRes, examsRes, actRes] = await Promise.all([
+      this.authFetch('/api/auth/me'),
+      this.authFetch('/api/notebooks'),
+      this.authFetch('/api/exams'),
+      this.authFetch('/api/activity'),
+    ]);
+
+    if (!meRes.ok) {
+      throw await this.parseErrorResponse(meRes, 'Failed to load authenticated student profile.');
+    }
+
+    const meData = await meRes.json();
+    this.profile = meData.profile;
+
+    if (nbRes.ok) {
+      const nbData = await nbRes.json();
+      this.notebooks = Array.isArray(nbData.notebooks)
+        ? nbData.notebooks.map(mapServerNotebook)
+        : [];
+    }
+
+    if (examsRes.ok) {
+      const examData = await examsRes.json();
+      this.examResults = Array.isArray(examData.exams) ? examData.exams : [];
+    }
+
+    if (actRes.ok) {
+      const actData = await actRes.json();
+      this.recentActivity = Array.isArray(actData.activity) ? actData.activity : [];
+    }
+  }
+
+  async authenticateUser(
     emailInput: string,
     passwordInput: string
-  ): { success: boolean; error?: string; profile?: StudentProfile } {
+  ): Promise<{ success: boolean; error?: string; profile?: StudentProfile }> {
     const email = (emailInput || '').trim().toLowerCase();
-    const password = (passwordInput || '').trim();
+    const password = passwordInput || '';
 
-    if (!email) {
-      return { success: false, error: 'Email address is required.' };
-    }
+    if (!email) return { success: false, error: 'Email address is required.' };
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
       return { success: false, error: 'Please enter a valid email address (e.g., student@university.edu).' };
     }
-    if (!password) {
-      return { success: false, error: 'Password is required.' };
-    }
+    if (!password) return { success: false, error: 'Password is required.' };
 
-    const users = this.getRegisteredUsers();
-    const user = users.find((u) => u.email.toLowerCase() === email);
-
-    if (!user) {
+    if (!isSupabaseClientConfigured()) {
       return {
         success: false,
-        error: `No registered account found for "${email}". Please check the spelling or switch to Register to create a new account.`,
+        error: 'Supabase authentication is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.',
       };
     }
 
-    if (user.password !== password) {
+    try {
+      const supabase = getSupabaseClient();
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+
+      if (error) {
+        return {
+          success: false,
+          error: error.message || 'Invalid login credentials.',
+        };
+      }
+
+      if (!data.session?.access_token) {
+        return {
+          success: false,
+          error: 'Please confirm your email address before signing in.',
+        };
+      }
+
+      this.accessToken = data.session.access_token;
+      await this.bootstrapUserData();
+
+      if (!this.profile) {
+        return { success: false, error: 'Unable to load student profile after sign-in.' };
+      }
+
+      return { success: true, profile: this.profile };
+    } catch (err: any) {
       return {
         success: false,
-        error: 'Incorrect password. Please verify your password and try again.',
+        error: err?.message || 'Unable to reach authentication service.',
       };
     }
-
-    const token = 'jwt_token_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
-    localStorage.setItem(STORAGE_KEYS.AUTH, token);
-
-    const profile: StudentProfile = {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      avatar: user.avatar || user.name.slice(0, 2).toUpperCase(),
-      degree: user.degree || 'Master of Computer Applications (MCA)',
-      semester: user.semester || 'Semester II',
-      university: user.university || 'Department of Computer Science',
-    };
-
-    this.setStorage(STORAGE_KEYS.PROFILE, profile);
-    return { success: true, profile };
   }
 
-  registerUser(data: {
+  async registerUser(data: {
     name: string;
     email: string;
     password: string;
     degree?: string;
     semester?: string;
     university?: string;
-  }): { success: boolean; error?: string; profile?: StudentProfile } {
+  }): Promise<{
+    success: boolean;
+    error?: string;
+    profile?: StudentProfile;
+    needsEmailVerification?: boolean;
+    message?: string;
+  }> {
     const name = (data.name || '').trim();
     const email = (data.email || '').trim().toLowerCase();
-    const password = (data.password || '').trim();
+    const password = data.password || '';
 
     if (!name || name.length < 2) {
       return { success: false, error: 'Full name must be at least 2 characters.' };
@@ -287,11 +456,10 @@ class ApiService {
       return { success: false, error: 'Password must be at least 6 characters long.' };
     }
 
-    const users = this.getRegisteredUsers();
-    if (users.some((u) => u.email.toLowerCase() === email)) {
+    if (!isSupabaseClientConfigured()) {
       return {
         success: false,
-        error: 'An account with this email address already exists. Please sign in instead.',
+        error: 'Supabase authentication is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.',
       };
     }
 
@@ -304,321 +472,300 @@ class ApiService {
         .slice(0, 2)
         .toUpperCase() || 'ST';
 
-    const newUser: StoredUser = {
-      id: 'student_' + Date.now(),
-      name,
-      email,
-      password,
-      degree: data.degree || 'Master of Computer Applications (MCA)',
-      semester: data.semester || 'Semester II',
-      university: data.university || 'Department of Computer Science',
-      avatar: initials,
-      createdAt: new Date().toISOString(),
-    };
+    try {
+      const supabase = getSupabaseClient();
+      const { data: authData, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            name,
+            avatar: initials,
+            degree: data.degree || 'Master of Computer Applications (MCA)',
+            semester: data.semester || 'Semester II',
+            university: data.university || 'Department of Computer Science',
+          },
+        },
+      });
 
-    users.push(newUser);
-    this.setStorage(STORAGE_KEYS.USERS, users);
+      if (error) {
+        return { success: false, error: error.message || 'Registration failed.' };
+      }
 
-    const token = 'jwt_token_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
-    localStorage.setItem(STORAGE_KEYS.AUTH, token);
+      if (!authData.session?.access_token) {
+        return {
+          success: true,
+          needsEmailVerification: true,
+          message: `Account created for ${email}. Please check your inbox and click the confirmation link to activate your account, then sign in.`,
+        };
+      }
 
-    const profile: StudentProfile = {
-      id: newUser.id,
-      name: newUser.name,
-      email: newUser.email,
-      avatar: newUser.avatar,
-      degree: newUser.degree,
-      semester: newUser.semester,
-      university: newUser.university,
-    };
+      this.accessToken = authData.session.access_token;
+      await this.bootstrapUserData();
 
-    this.setStorage(STORAGE_KEYS.PROFILE, profile);
+      return {
+        success: true,
+        profile: this.profile || undefined,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: err?.message || 'Unable to register student account.',
+      };
+    }
+  }
 
-    // Initialize personal dashboard activity for this new user
-    const userActivityKey = this.getUserScopedKey(STORAGE_KEYS.ACTIVITY, newUser.id);
-    const welcomeActivity: RecentActivityItem[] = [
-      {
-        id: 'act_reg_' + Date.now(),
-        type: 'document',
-        title: 'Personal Workspace Initialized',
-        subtitle: `Account created for ${newUser.name} (${newUser.degree})`,
-        timestamp: 'Just now',
-        notebookTitle: 'Dashboard',
-      },
-    ];
-    this.setStorage(userActivityKey, welcomeActivity);
+  async requestPasswordReset(emailInput: string): Promise<{ success: boolean; error?: string }> {
+    const email = (emailInput || '').trim().toLowerCase();
+    if (!email) {
+      return { success: false, error: 'Please enter your student email address.' };
+    }
+    if (!isSupabaseClientConfigured()) {
+      return { success: false, error: 'Supabase authentication is not configured.' };
+    }
 
-    // Initialize personal notebooks key to empty array for new user
-    const userNotebooksKey = this.getUserScopedKey(STORAGE_KEYS.NOTEBOOKS, newUser.id);
-    this.setStorage(userNotebooksKey, []);
-
-    return { success: true, profile };
+    try {
+      const supabase = getSupabaseClient();
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: typeof window !== 'undefined' ? window.location.origin : undefined,
+      });
+      if (error) {
+        return { success: false, error: error.message };
+      }
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to send password reset email.' };
+    }
   }
 
   getRememberedEmail(): string {
-    return localStorage.getItem(STORAGE_KEYS.REMEMBER_EMAIL) || '';
+    try {
+      return localStorage.getItem(STORAGE_KEYS.REMEMBER_EMAIL) || '';
+    } catch {
+      return '';
+    }
   }
 
   setRememberedEmail(email: string, remember: boolean): void {
-    if (remember && email.trim()) {
-      localStorage.setItem(STORAGE_KEYS.REMEMBER_EMAIL, email.trim());
-    } else {
-      localStorage.removeItem(STORAGE_KEYS.REMEMBER_EMAIL);
+    try {
+      if (remember && email.trim()) {
+        localStorage.setItem(STORAGE_KEYS.REMEMBER_EMAIL, email.trim());
+      } else {
+        localStorage.removeItem(STORAGE_KEYS.REMEMBER_EMAIL);
+      }
+    } catch {
+      // ignore
     }
   }
 
-  logout(): void {
-    localStorage.removeItem(STORAGE_KEYS.AUTH);
-    localStorage.removeItem(STORAGE_KEYS.PROFILE);
-  }
-
-  // Notebooks
-  getNotebooks(customUserId?: string): Notebook[] {
-    const uid = customUserId || this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.NOTEBOOKS, uid);
-    const existing = localStorage.getItem(key);
-    if (existing !== null) {
+  async logout(): Promise<void> {
+    this.clearInMemoryCaches();
+    if (isSupabaseClientConfigured()) {
       try {
-        const list: Notebook[] = JSON.parse(existing);
-        return (list || []).filter(
-          (nb: Notebook) =>
-            nb.id !== 'nb_dbms' &&
-            nb.id !== 'nb_cn' &&
-            nb.id !== 'nb_os' &&
-            nb.title !== 'Database Management Systems'
-        );
-      } catch {
-        return [];
+        const supabase = getSupabaseClient();
+        await supabase.auth.signOut();
+      } catch (err) {
+        console.warn('Sign out warning:', err);
       }
     }
-
-    this.setStorage(key, []);
-    return [];
   }
 
-  saveNotebooks(notebooks: Notebook[], customUserId?: string): void {
-    const uid = customUserId || this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.NOTEBOOKS, uid);
-    this.setStorage(key, notebooks);
+  async updateProfile(profileUpdates: Partial<StudentProfile>): Promise<StudentProfile> {
+    const res = await this.authFetch('/api/auth/me', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: profileUpdates.name,
+        degree: profileUpdates.degree,
+        semester: profileUpdates.semester,
+        university: profileUpdates.university,
+        avatar: profileUpdates.avatar,
+      }),
+    });
+
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to update profile.');
+    }
+
+    const data = await res.json();
+    this.profile = data.profile;
+    return data.profile;
+  }
+
+  // ============================================================
+  // NOTEBOOKS (BACKED BY POSTGRESQL)
+  // ============================================================
+
+  getNotebooks(): Notebook[] {
+    return this.notebooks;
   }
 
   getNotebookById(id: string): Notebook | undefined {
-    const notebooks = this.getNotebooks();
-    return notebooks.find((nb) => nb.id === id);
+    return this.notebooks.find((nb) => nb.id === id);
   }
 
-  createNotebook(
+  async refreshNotebooks(): Promise<Notebook[]> {
+    const res = await this.authFetch('/api/notebooks');
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to refresh notebooks.');
+    }
+    const data = await res.json();
+    this.notebooks = Array.isArray(data.notebooks)
+      ? data.notebooks.map(mapServerNotebook)
+      : [];
+    return this.notebooks;
+  }
+
+  async createNotebook(
     titleOrData: string | { title: string; code?: string; description?: string },
     description?: string,
     code?: string
-  ): Notebook {
-    const notebooks = this.getNotebooks();
+  ): Promise<Notebook> {
     const title = typeof titleOrData === 'string' ? titleOrData : titleOrData.title;
-    const finalCode =
-      typeof titleOrData === 'string'
-        ? code || 'MCA-' + (200 + notebooks.length + 1)
-        : titleOrData.code || 'MCA-' + (200 + notebooks.length + 1);
-    const finalDesc =
-      typeof titleOrData === 'string'
-        ? description || 'Custom study notebook for student course preparation.'
-        : titleOrData.description || 'Custom study notebook for student course preparation.';
+    const finalCode = typeof titleOrData === 'string' ? code : titleOrData.code;
+    const finalDesc = typeof titleOrData === 'string' ? description : titleOrData.description;
 
-    const newNotebook: Notebook = {
-      id: 'nb_' + Date.now(),
-      title,
-      code: finalCode,
-      description: finalDesc,
-      iconName: 'BookOpen',
-      accentColor: '#2563EB',
-      documentsCount: 0,
-      progress: 0,
-      lastStudied: 'Just now',
-      documents: [],
-    };
-    const updated = [newNotebook, ...notebooks];
-    this.saveNotebooks(updated);
-    this.addActivity({
-      type: 'document',
-      title: `Created notebook: ${newNotebook.title}`,
-      subtitle: 'Ready for PDF source upload and AI indexing',
-      notebookTitle: newNotebook.title,
+    const res = await this.authFetch('/api/notebooks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title,
+        code: finalCode,
+        description: finalDesc,
+      }),
     });
-    return newNotebook;
-  }
 
-  loadStarterCoursesForActiveUser(): Notebook[] {
-    const uid = this.getActiveUserId();
-    const starterCourses: Notebook[] = JSON.parse(JSON.stringify(initialNotebooks)).map((nb: Notebook) => ({
-      ...nb,
-      id: `nb_${nb.id.replace('nb_', '')}_${Date.now().toString(36)}`,
-      lastStudied: 'Just now',
-      progress: 0,
-    }));
-
-    this.saveNotebooks(starterCourses, uid);
-    this.addActivity({
-      type: 'document',
-      title: 'Loaded Starter MCA Courses',
-      subtitle: 'DBMS, Computer Networks, and Operating Systems added to your dashboard',
-      notebookTitle: 'Personal Dashboard',
-    });
-    return starterCourses;
-  }
-
-  deleteNotebook(id: string): void {
-    const uid = this.getActiveUserId();
-    const notebooks = this.getNotebooks();
-    const target = notebooks.find((nb) => nb.id === id);
-    const filtered = notebooks.filter((nb) => nb.id !== id);
-    this.saveNotebooks(filtered);
-
-    // Clean up local chat messages for this notebook
-    try {
-      const chatsKey = this.getUserScopedKey(STORAGE_KEYS.CHATS, uid);
-      const stored = this.getStorage<Record<string, ChatMessage[]>>(chatsKey, {});
-      if (stored && typeof stored === 'object') {
-        const updatedChats = { ...stored };
-        delete updatedChats[id];
-        this.setStorage(chatsKey, updatedChats);
-      }
-    } catch {
-      // Ignore
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to create notebook.');
     }
 
-    // Record activity
-    if (target) {
-      this.addActivity({
-        type: 'document',
-        title: `Deleted notebook "${target.title}"`,
-        subtitle: 'All documents and study data cleared',
-        notebookTitle: target.title,
-      });
-    }
-
-    // Inform backend to clean up indexed files and vectors
-    const userQuery = uid && uid !== 'guest' ? `?userId=${encodeURIComponent(uid)}` : '';
-    fetch(`/api/documents/notebooks/${encodeURIComponent(id)}${userQuery}`, { method: 'DELETE' }).catch((err) => {
-      console.warn('Backend notebook deletion notice failed:', err);
-    });
+    const data = await res.json();
+    const created = mapServerNotebook(data.notebook);
+    this.notebooks = [created, ...this.notebooks.filter((n) => n.id !== created.id)];
+    await this.fetchRecentActivity().catch(() => {});
+    return created;
   }
 
-  // Documents
-  addDocumentToNotebook(notebookId: string, doc: DocumentItem): void {
-    const notebooks = this.getNotebooks();
-    const updated = notebooks.map((nb) => {
-      if (nb.id === notebookId) {
-        return {
-          ...nb,
-          documentsCount: nb.documentsCount + 1,
-          lastStudied: 'Just now',
-          documents: [doc, ...nb.documents],
-        };
-      }
-      return nb;
+  async deleteNotebook(id: string): Promise<void> {
+    const res = await this.authFetch(`/api/notebooks/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
     });
 
-    this.saveNotebooks(updated);
-    const targetNb = notebooks.find((n) => n.id === notebookId);
-    this.addActivity({
-      type: 'document',
-      title: `Uploaded ${doc.name}`,
-      subtitle: `${doc.pages} pages processed • ${doc.extractedChunksCount} vector chunks indexed`,
-      notebookTitle: targetNb?.title || 'Notebook',
-    });
-  }
-
-
-
-  deleteDocument(notebookId: string, docId: string): void {
-    const notebooks = this.getNotebooks().map((nb) => {
-      if (nb.id === notebookId) {
-        return {
-          ...nb,
-          documentsCount: Math.max(0, nb.documentsCount - 1),
-          documents: nb.documents.filter((d) => d.id !== docId),
-        };
-      }
-      return nb;
-    });
-    this.saveNotebooks(notebooks);
-  }
-
-  // Chat & AI Tutor
-  getChatMessages(notebookId: string): ChatMessage[] {
-    const uid = this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.CHATS, uid);
-    try {
-      const allChats = this.getStorage<Record<string, ChatMessage[]>>(key, {});
-      if (allChats && typeof allChats === 'object' && !Array.isArray(allChats)) {
-        if (Array.isArray(allChats[notebookId])) {
-          return allChats[notebookId];
-        }
-      }
-      return [];
-    } catch {
-      return [];
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to delete notebook.');
     }
+
+    this.notebooks = this.notebooks.filter((nb) => nb.id !== id);
+    delete this.chatsByNotebook[id];
+    delete this.chatSummaries[id];
+    await this.fetchRecentActivity().catch(() => {});
   }
-
-  saveChatMessages(notebookId: string, messages: ChatMessage[]): void {
-    const uid = this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.CHATS, uid);
-    try {
-      const stored = this.getStorage<Record<string, ChatMessage[]>>(key, {});
-      const allChats = (stored && typeof stored === 'object' && !Array.isArray(stored)) ? { ...stored } : {};
-      allChats[notebookId] = messages;
-      this.setStorage(key, allChats);
-    } catch (e) {
-      console.warn('Failed saving chat messages:', e);
-    }
-  }
-
-  clearChatMessages(notebookId: string): void {
-    const uid = this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.CHATS, uid);
-    try {
-      const stored = this.getStorage<Record<string, ChatMessage[]>>(key, {});
-      const allChats = (stored && typeof stored === 'object' && !Array.isArray(stored)) ? { ...stored } : {};
-      delete allChats[notebookId];
-      this.setStorage(key, allChats);
-    } catch (e) {
-      console.warn('Failed clearing chat messages:', e);
-    }
-  }
-
-
 
   // ============================================================
-  // SMART SUMMARY SUITE (Notebook Chat & Per-PDF Summaries)
+  // CHAT MESSAGES (BACKED BY POSTGRESQL)
+  // ============================================================
+
+  getChatMessages(notebookId: string): ChatMessage[] {
+    return this.chatsByNotebook[notebookId] || [];
+  }
+
+  async fetchChatMessages(notebookId: string): Promise<ChatMessage[]> {
+    const res = await this.authFetch(`/api/notebooks/${encodeURIComponent(notebookId)}/messages`);
+    if (!res.ok) {
+      if (res.status === 404) return [];
+      throw await this.parseErrorResponse(res, 'Failed to load chat history.');
+    }
+    const data = await res.json();
+    const list: ChatMessage[] = Array.isArray(data.messages) ? data.messages : [];
+    this.chatsByNotebook[notebookId] = list;
+    return list;
+  }
+
+  async persistChatMessage(notebookId: string, message: ChatMessage): Promise<ChatMessage> {
+    const current = this.chatsByNotebook[notebookId] || [];
+    if (!current.some((m) => m.id === message.id)) {
+      this.chatsByNotebook[notebookId] = [...current, message];
+    }
+
+    const res = await this.authFetch(`/api/notebooks/${encodeURIComponent(notebookId)}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to save chat message.');
+    }
+    const data = await res.json();
+    return data.message || message;
+  }
+
+  async clearChatMessages(notebookId: string): Promise<void> {
+    const res = await this.authFetch(`/api/notebooks/${encodeURIComponent(notebookId)}/messages`, {
+      method: 'DELETE',
+    });
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to clear chat history.');
+    }
+    delete this.chatsByNotebook[notebookId];
+    delete this.chatSummaries[notebookId];
+  }
+
+  // ============================================================
+  // SMART SUMMARY SUITE (POSTGRESQL + GEMINI BACKEND)
   // ============================================================
 
   getNotebookChatSummary(notebookId: string): NotebookChatSummary | null {
-    const uid = this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.SUMMARY_CHATS, uid);
-    try {
-      const all = this.getStorage<Record<string, NotebookChatSummary>>(key, {});
-      return all[notebookId] || null;
-    } catch {
-      return null;
-    }
+    return this.chatSummaries[notebookId] || null;
   }
 
   saveNotebookChatSummary(summary: NotebookChatSummary): void {
-    const uid = this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.SUMMARY_CHATS, uid);
-    try {
-      const all = this.getStorage<Record<string, NotebookChatSummary>>(key, {});
-      all[summary.notebookId] = summary;
-      this.setStorage(key, all);
-      this.addActivity({
-        type: 'note',
-        title: 'Generated Chat Summary',
-        subtitle: `Chat conversation summary for ${summary.notebookTitle}`,
-        notebookTitle: summary.notebookTitle,
-      });
-    } catch (e) {
-      console.warn('Failed to save chat summary:', e);
+    this.chatSummaries[summary.notebookId] = summary;
+  }
+
+  async fetchNotebookSummaries(notebookId: string): Promise<{
+    chatSummary: NotebookChatSummary | null;
+    documentSummaries: DocumentSummary[];
+  }> {
+    const res = await this.authFetch(`/api/summary/notebook/${encodeURIComponent(notebookId)}`);
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to load saved summaries.');
     }
+    const data = await res.json();
+    const nb = this.getNotebookById(notebookId);
+
+    let chatSummary: NotebookChatSummary | null = null;
+    if (data.chatSummary) {
+      chatSummary = {
+        notebookId,
+        notebookTitle: nb?.title || data.chatSummary.notebookTitle || 'Course Notebook',
+        summary: data.chatSummary.summary,
+        generatedAt: data.chatSummary.generatedAt,
+        messageCount: data.chatSummary.messageCount || 0,
+        hasChat: true,
+      };
+      this.chatSummaries[notebookId] = chatSummary;
+    }
+
+    const documentSummaries: DocumentSummary[] = [];
+    if (Array.isArray(data.documentSummaries)) {
+      for (const d of data.documentSummaries) {
+        const mapped: DocumentSummary = {
+          documentId: d.documentId,
+          notebookId: d.notebookId,
+          fileName: d.originalFileName || d.fileName,
+          summary: d.summary,
+          generatedAt: d.generatedAt,
+          pageCount: d.pageCount || 1,
+          fileSize: d.fileSize,
+          status: 'completed',
+        };
+        this.docSummaries[mapped.documentId] = mapped;
+        documentSummaries.push(mapped);
+      }
+    }
+
+    return { chatSummary, documentSummaries };
   }
 
   async fetchOrGenerateChatSummary(
@@ -630,7 +777,7 @@ class ApiService {
     const validHistory = history.filter((m) => m && m.text && m.text.trim().length > 0);
 
     if (validHistory.length === 0) {
-      const emptySummary: NotebookChatSummary = {
+      return {
         notebookId,
         notebookTitle,
         summary: `> **No Chat History Available**\n\nYou haven't started a conversation in **${notebookTitle}** yet. Ask questions in the AI Tutor chat workspace to build your study dialogue, and generate a comprehensive conversation summary anytime!`,
@@ -638,10 +785,8 @@ class ApiService {
         messageCount: 0,
         hasChat: false,
       };
-      return emptySummary;
     }
 
-    // Check localStorage cache if not forced
     if (!forceRegenerate) {
       const cached = this.getNotebookChatSummary(notebookId);
       if (cached && cached.messageCount === validHistory.length && cached.hasChat) {
@@ -649,10 +794,8 @@ class ApiService {
       }
     }
 
-    const uid = this.requireActiveUserId();
     const payload = {
       notebookId,
-      userId: uid,
       notebookTitle,
       forceRegenerate,
       history: validHistory.map((m) => ({
@@ -664,12 +807,13 @@ class ApiService {
 
     let res: Response;
     try {
-      res = await fetch('/api/summary/chat', {
+      res = await this.authFetch('/api/summary/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
     } catch (err: any) {
+      if (err instanceof ApiError) throw err;
       throw new ApiError(
         err?.message || 'Unable to connect to the summary server. Please check your connection and try again.',
         'NETWORK_ERROR',
@@ -695,49 +839,21 @@ class ApiService {
   }
 
   getDocumentSummary(documentId: string): DocumentSummary | null {
-    const uid = this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.SUMMARY_DOCS, uid);
-    try {
-      const all = this.getStorage<Record<string, DocumentSummary>>(key, {});
-      return all[documentId] || null;
-    } catch {
-      return null;
-    }
+    return this.docSummaries[documentId] || null;
   }
 
   saveDocumentSummary(summary: DocumentSummary): void {
-    const uid = this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.SUMMARY_DOCS, uid);
-    try {
-      const all = this.getStorage<Record<string, DocumentSummary>>(key, {});
-      all[summary.documentId] = summary;
-      this.setStorage(key, all);
-      this.addActivity({
-        type: 'document',
-        title: `Summary for ${summary.fileName}`,
-        subtitle: `Smart Document Summary generated (${summary.pageCount} pages)`,
-        notebookTitle: 'Document Repository',
-      });
-    } catch (e) {
-      console.warn('Failed to save doc summary:', e);
-    }
+    this.docSummaries[summary.documentId] = summary;
   }
 
   getAllDocumentSummaries(notebookId: string): Record<string, DocumentSummary> {
-    const uid = this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.SUMMARY_DOCS, uid);
-    try {
-      const all = this.getStorage<Record<string, DocumentSummary>>(key, {});
-      const filtered: Record<string, DocumentSummary> = {};
-      Object.entries(all).forEach(([docId, sum]) => {
-        if (sum.notebookId === notebookId) {
-          filtered[docId] = sum;
-        }
-      });
-      return filtered;
-    } catch {
-      return {};
-    }
+    const filtered: Record<string, DocumentSummary> = {};
+    Object.entries(this.docSummaries).forEach(([docId, sum]) => {
+      if (sum.notebookId === notebookId) {
+        filtered[docId] = sum;
+      }
+    });
+    return filtered;
   }
 
   async fetchOrGenerateDocumentSummary(
@@ -745,14 +861,12 @@ class ApiService {
     notebookId: string,
     forceRegenerate: boolean = false
   ): Promise<DocumentSummary> {
-    const notebooks = this.getNotebooks();
-    const targetNb = notebooks.find((n) => n.id === notebookId);
+    const targetNb = this.notebooks.find((n) => n.id === notebookId);
     const targetDoc = targetNb?.documents.find((d) => d.id === documentId);
     const fileName = targetDoc?.name || 'Document.pdf';
     const pageCount = targetDoc?.pages || 1;
     const fileSize = targetDoc?.size || '1.0 MB';
 
-    // Check localStorage cache if not forced
     if (!forceRegenerate) {
       const cached = this.getDocumentSummary(documentId);
       if (cached && cached.status === 'completed' && cached.summary && cached.summary.length > 50) {
@@ -760,22 +874,19 @@ class ApiService {
       }
     }
 
-    const uid = this.requireActiveUserId();
-    const payload = {
-      documentId,
-      notebookId,
-      userId: uid,
-      forceRegenerate,
-    };
-
     let res: Response;
     try {
-      res = await fetch('/api/summary/document', {
+      res = await this.authFetch('/api/summary/document', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          documentId,
+          notebookId,
+          forceRegenerate,
+        }),
       });
     } catch (err: any) {
+      if (err instanceof ApiError) throw err;
       throw new ApiError(
         err?.message || 'Unable to connect to the summary server. Please check your connection and try again.',
         'NETWORK_ERROR',
@@ -806,7 +917,10 @@ class ApiService {
     return summaryObj;
   }
 
-  // Questions & Exams
+  // ============================================================
+  // QUESTIONS & EXAMS (PERSISTED TO POSTGRESQL)
+  // ============================================================
+
   getQuestions(count: number = 10, topic?: string): PracticeQuestion[] {
     let list = [...sampleQuestions];
     if (topic && topic !== 'All Topics') {
@@ -815,20 +929,19 @@ class ApiService {
     return list.slice(0, count);
   }
 
-  getExamQuestions(notebookId?: string): PracticeQuestion[] {
+  getExamQuestions(_notebookId?: string): PracticeQuestion[] {
     return this.getQuestions(10);
   }
 
-  submitExam(
+  async submitExam(
     notebookId: string,
     questions: PracticeQuestion[],
     userAnswers: Record<number, number>,
     timeTakenSeconds: number
-  ): ExamResult {
+  ): Promise<ExamResult> {
     let correctCount = 0;
     let incorrectCount = 0;
     let skippedCount = 0;
-
     const topicStats: Record<string, { correct: number; total: number }> = {};
 
     const reviewQuestions = questions.map((q, idx) => {
@@ -836,28 +949,15 @@ class ApiService {
       const hasAnswered = selected !== undefined && selected !== null;
       const isCorrect = hasAnswered && selected === q.correctAnswer;
 
-      if (!hasAnswered) {
-        skippedCount++;
-      } else if (isCorrect) {
-        correctCount++;
-      } else {
-        incorrectCount++;
-      }
+      if (!hasAnswered) skippedCount++;
+      else if (isCorrect) correctCount++;
+      else incorrectCount++;
 
-      // Track by topic
-      if (!topicStats[q.topic]) {
-        topicStats[q.topic] = { correct: 0, total: 0 };
-      }
+      if (!topicStats[q.topic]) topicStats[q.topic] = { correct: 0, total: 0 };
       topicStats[q.topic].total += 1;
-      if (isCorrect) {
-        topicStats[q.topic].correct += 1;
-      }
+      if (isCorrect) topicStats[q.topic].correct += 1;
 
-      return {
-        question: q,
-        selectedOption: selected,
-        isCorrect,
-      };
+      return { question: q, selectedOption: selected, isCorrect };
     });
 
     const totalQuestions = questions.length;
@@ -896,59 +996,41 @@ class ApiService {
       timeTakenSeconds,
       topicPerformance,
       strongTopics: strongTopics.length ? strongTopics : ['General Concepts'],
-      weakTopics: weakTopics.length ? weakTopics : [],
+      weakTopics,
       recommendation,
       reviewQuestions,
     };
 
-    // Update notebook progress
-    if (nb) {
-      const updatedNbs = this.getNotebooks().map((n) => {
-        if (n.id === notebookId) {
-          return {
-            ...n,
-            progress: Math.min(100, Math.max(n.progress, percentage)),
-            lastStudied: 'Just now',
-          };
-        }
-        return n;
-      });
-      this.saveNotebooks(updatedNbs);
-    }
-
-    // Save exam result to user-scoped history
-    const uid = this.getActiveUserId();
-    const examKey = this.getUserScopedKey(STORAGE_KEYS.EXAM_RESULTS, uid);
-    const existingExams = this.getStorage<ExamResult[]>(examKey, []);
-    this.setStorage(examKey, [result, ...existingExams]);
-
-    // Add recent activity
-    this.addActivity({
-      type: 'exam',
-      title: `Completed ${nb?.title || 'Course'} Practice Test`,
-      subtitle: `Score: ${correctCount} / ${totalQuestions} (${percentage}%) • Time: ${Math.floor(timeTakenSeconds / 60)}m ${timeTakenSeconds % 60}s`,
-      timestamp: 'Just now',
-      score: `${percentage}%`,
-      notebookTitle: nb?.title || 'Course',
+    const res = await this.authFetch('/api/exams', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(result),
     });
 
-    return result;
-  }
-
-  // User Exam History & Stats
-  getUserExamResults(userId?: string): ExamResult[] {
-    const uid = userId || this.getActiveUserId();
-    const examKey = this.getUserScopedKey(STORAGE_KEYS.EXAM_RESULTS, uid);
-    const stored = this.getStorage<ExamResult[] | null>(examKey, null);
-    if (stored !== null) {
-      return stored;
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to save exam result.');
     }
-    return [];
+
+    const saved = await res.json();
+    const persistedResult: ExamResult = saved.exam || result;
+
+    this.examResults = [persistedResult, ...this.examResults];
+    this.notebooks = this.notebooks.map((n) =>
+      n.id === notebookId
+        ? { ...n, progress: Math.min(100, Math.max(n.progress, percentage)), lastStudied: 'Just now' }
+        : n
+    );
+    await this.fetchRecentActivity().catch(() => {});
+
+    return persistedResult;
   }
 
-  getUserExamStats(userId?: string): { examsCompleted: number; averageScore: string } {
-    const uid = userId || this.getActiveUserId();
-    const exams = this.getUserExamResults(uid);
+  getUserExamResults(): ExamResult[] {
+    return this.examResults;
+  }
+
+  getUserExamStats(): { examsCompleted: number; averageScore: string } {
+    const exams = this.examResults;
     if (exams.length === 0) {
       return { examsCompleted: 0, averageScore: '—' };
     }
@@ -959,44 +1041,34 @@ class ApiService {
     };
   }
 
-  // Activity & Analytics
-  getRecentActivity(userId?: string): RecentActivityItem[] {
-    const uid = userId || this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.ACTIVITY, uid);
-    const stored = localStorage.getItem(key);
-    if (stored !== null) {
-      try {
-        return JSON.parse(stored);
-      } catch {
-        return [];
-      }
+  // ============================================================
+  // ACTIVITY & ANALYTICS
+  // ============================================================
+
+  getRecentActivity(): RecentActivityItem[] {
+    return this.recentActivity;
+  }
+
+  async fetchRecentActivity(): Promise<RecentActivityItem[]> {
+    const res = await this.authFetch('/api/activity');
+    if (res.ok) {
+      const data = await res.json();
+      this.recentActivity = Array.isArray(data.activity) ? data.activity : [];
     }
-
-    return [];
+    return this.recentActivity;
   }
 
-  addActivity(item: Omit<RecentActivityItem, 'id' | 'timestamp'> & { timestamp?: string }): void {
-    const uid = this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.ACTIVITY, uid);
-    const list = this.getRecentActivity();
-    const newItem: RecentActivityItem = {
-      id: 'act_' + Date.now(),
-      timestamp: item.timestamp || 'Just now',
-      ...item,
-    };
-    this.setStorage(key, [newItem, ...list.slice(0, 15)]);
+  async clearRecentActivity(): Promise<void> {
+    const res = await this.authFetch('/api/activity', { method: 'DELETE' });
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to clear recent activity.');
+    }
+    this.recentActivity = [];
   }
 
-  clearRecentActivity(userId?: string): void {
-    const uid = userId || this.getActiveUserId();
-    const key = this.getUserScopedKey(STORAGE_KEYS.ACTIVITY, uid);
-    this.setStorage(key, []);
-  }
-
-  getAnalytics(userId?: string): AnalyticsData {
-    const uid = userId || this.getActiveUserId();
-    const notebooks = this.getNotebooks(uid);
-    const exams = this.getUserExamResults(uid);
+  getAnalytics(): AnalyticsData {
+    const notebooks = this.notebooks;
+    const exams = this.examResults;
 
     const totalDocs = notebooks.reduce((acc, n) => acc + n.documentsCount, 0);
     const totalQuestions = exams.reduce((acc, e) => acc + e.totalQuestions, 0);
@@ -1059,7 +1131,7 @@ class ApiService {
       examsCompleted: exams.length,
       averageScore: avgPct,
       questionsAnswered: totalQuestions,
-      studyProgress: studyProgress,
+      studyProgress,
       scoreHistory: scoreHistory.length > 0 ? scoreHistory : [{ date: 'Today', score: 0, subject: 'None' }],
       topicAccuracy: topicAccuracy.length > 0 ? topicAccuracy : [{ topic: 'General', accuracy: 0, totalQuestions: 0 }],
       weakTopics,
@@ -1072,6 +1144,10 @@ class ApiService {
           : 'Great work! Continue regular practice tests to maintain topic mastery.',
     };
   }
+
+  // ============================================================
+  // DOCUMENT UPLOAD, STORAGE SIGNED URLS, RETRY & VECTOR RAG
+  // ============================================================
 
   async uploadDocumentToBackend(
     file: File,
@@ -1088,18 +1164,16 @@ class ApiService {
     }) => void,
     signal?: AbortSignal
   ): Promise<{ documentId: string; document: DocumentItem }> {
-    const uid = this.requireActiveUserId();
+    this.requireActiveUserId();
     const formData = new FormData();
     formData.append('file', file);
     formData.append('notebookId', notebookId);
-    formData.append('userId', uid);
 
-    // 1. Initial stage indication
     if (onStatusUpdate) {
       onStatusUpdate({
         stage: 'Uploading document to server',
         progress: 10,
-        message: 'Streaming file to backend storage...',
+        message: 'Streaming file to private Supabase Storage...',
         status: 'UPLOADING',
       });
     }
@@ -1107,13 +1181,12 @@ class ApiService {
     let uploadData: any = null;
     let lastError: ApiError | null = null;
 
-    // Try backend upload with quick retry only on transient network/5xx errors
     for (let attempt = 0; attempt < 2; attempt++) {
       if (signal?.aborted) {
         throw new DOMException('Upload aborted by user', 'AbortError');
       }
       try {
-        const uploadRes = await fetch('/api/documents/upload', {
+        const uploadRes = await this.authFetch('/api/documents/upload', {
           method: 'POST',
           body: formData,
           signal,
@@ -1153,16 +1226,45 @@ class ApiService {
 
     const documentId = uploadData.documentId;
 
+    // If synchronous processing already finished (e.g. Vercel inline fallback)
+    if (uploadData.status === 'COMPLETED' && uploadData.document) {
+      const completedDoc = mapServerDocumentToItem(uploadData.document);
+      if (onStatusUpdate) {
+        onStatusUpdate({
+          stage: completedDoc.currentStage || 'COMPLETED',
+          progress: 100,
+          message: completedDoc.message || 'Document indexed successfully.',
+          totalPages: completedDoc.pages,
+          chunkCount: completedDoc.extractedChunksCount,
+          status: 'COMPLETED',
+          metrics: completedDoc.metrics,
+        });
+      }
+      this.appendDocumentToNotebook(notebookId, completedDoc);
+      await this.fetchRecentActivity().catch(() => {});
+      return { documentId, document: completedDoc };
+    }
+
     if (onStatusUpdate) {
       onStatusUpdate({
         stage: 'Document uploaded and queued',
         progress: 20,
-        message: 'File stored securely. Starting extraction worker...',
+        message: 'File stored securely in private bucket. Processing job queued...',
         status: 'UPLOADED',
       });
     }
 
-    // 2. Poll document processing status
+    return this.pollDocumentStatus(documentId, notebookId, file.name, formatBytes(file.size), onStatusUpdate, signal);
+  }
+
+  private pollDocumentStatus(
+    documentId: string,
+    notebookId: string,
+    fileName: string,
+    fileSizeLabel: string,
+    onStatusUpdate?: (status: any) => void,
+    signal?: AbortSignal
+  ): Promise<{ documentId: string; document: DocumentItem }> {
     return new Promise((resolve, reject) => {
       let pollAttempts = 0;
       let consecutiveFailures = 0;
@@ -1179,7 +1281,7 @@ class ApiService {
           clearInterval(interval);
           reject(
             new ApiError(
-              'Document processing timed out before completion. Please retry.',
+              'Document processing timed out before completion. You can check status or retry shortly.',
               'TIMEOUT',
               true,
               504
@@ -1189,31 +1291,23 @@ class ApiService {
         }
 
         try {
-          const statusRes = await fetch(`/api/documents/${encodeURIComponent(documentId)}/status`, { signal });
+          const statusRes = await this.authFetch(
+            `/api/documents/${encodeURIComponent(documentId)}/status`,
+            { signal }
+          );
           const contentType = statusRes.headers.get('content-type') || '';
 
           if (!statusRes.ok || !contentType.includes('application/json')) {
             consecutiveFailures++;
             const err = await this.parseErrorResponse(statusRes, 'Failed to read document processing status.');
-            if (statusRes.status === 404 || !err.retryable || consecutiveFailures >= 5) {
+            if (statusRes.status === 404 || statusRes.status === 401 || !err.retryable || consecutiveFailures >= 5) {
               clearInterval(interval);
               reject(err);
             }
             return;
           }
 
-          let data: any;
-          try {
-            data = await statusRes.json();
-          } catch {
-            consecutiveFailures++;
-            if (consecutiveFailures >= 5) {
-              clearInterval(interval);
-              reject(new ApiError('Invalid status response from document processing server.', 'INVALID_RESPONSE', true));
-            }
-            return;
-          }
-
+          const data = await statusRes.json();
           consecutiveFailures = 0;
 
           if (onStatusUpdate) {
@@ -1234,11 +1328,8 @@ class ApiService {
             const docItem: DocumentItem = {
               id: documentId,
               notebookId,
-              name: file.name,
-              size:
-                file.size < 1024 * 1024
-                  ? `${(file.size / 1024).toFixed(1)} KB`
-                  : `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+              name: fileName,
+              size: fileSizeLabel,
               pages: data.total_pages || 1,
               uploadDate: 'Just now',
               status: 'COMPLETED',
@@ -1247,16 +1338,18 @@ class ApiService {
               progress: 100,
               message: data.message,
               metrics: data.metrics,
-              previewSnippet: `Indexed ${data.chunk_count} vector chunks across ${data.total_pages} pages into persistent knowledge base.`,
+              previewSnippet: `Indexed ${data.chunk_count} vector chunks across ${data.total_pages} pages in PostgreSQL + pgvector.`,
             };
 
             this.appendDocumentToNotebook(notebookId, docItem);
+            await this.fetchRecentActivity().catch(() => {});
             resolve({ documentId, document: docItem });
           } else if (data.status === 'FAILED') {
             clearInterval(interval);
+            await this.refreshNotebooks().catch(() => {});
             reject(
               new ApiError(
-                data.error || data.message || `Document ingestion failed for "${file.name}".`,
+                data.error || data.message || `Document ingestion failed for "${fileName}".`,
                 'INGESTION_FAILED',
                 true
               )
@@ -1280,12 +1373,12 @@ class ApiService {
             );
           }
         }
-      }, 350);
+      }, 450);
     });
   }
 
   appendDocumentToNotebook(notebookId: string, doc: DocumentItem): void {
-    const notebooks = this.getNotebooks().map((nb) => {
+    this.notebooks = this.notebooks.map((nb) => {
       if (nb.id === notebookId) {
         const filteredDocs = nb.documents.filter((d) => d.id !== doc.id);
         return {
@@ -1297,15 +1390,35 @@ class ApiService {
       }
       return nb;
     });
+  }
 
-    this.saveNotebooks(notebooks);
-    const targetNb = notebooks.find((n) => n.id === notebookId);
-    this.addActivity({
-      type: 'document',
-      title: `Indexed ${doc.name}`,
-      subtitle: `${doc.pages} pages processed • ${doc.extractedChunksCount} vector embeddings stored`,
-      notebookTitle: targetNb?.title || 'Course',
+  async retryDocumentProcessing(documentId: string, notebookId: string): Promise<void> {
+    const res = await this.authFetch(`/api/documents/${encodeURIComponent(documentId)}/retry`, {
+      method: 'POST',
     });
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to retry document processing.');
+    }
+    const targetNb = this.getNotebookById(notebookId);
+    const doc = targetNb?.documents.find((d) => d.id === documentId);
+    await this.pollDocumentStatus(
+      documentId,
+      notebookId,
+      doc?.name || 'Document',
+      doc?.size || '0 KB'
+    );
+  }
+
+  async getDocumentDownloadUrl(documentId: string): Promise<{
+    url: string;
+    expiresInSeconds: number;
+    fileName: string;
+  }> {
+    const res = await this.authFetch(`/api/documents/${encodeURIComponent(documentId)}/download-url`);
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Unable to generate secure download link.');
+    }
+    return await res.json();
   }
 
   async sendRAGQuery(
@@ -1320,21 +1433,21 @@ class ApiService {
     retrievalScore: number;
     insufficientInfo: boolean;
   }> {
-    const uid = this.requireActiveUserId();
+    this.requireActiveUserId();
     let res: Response;
     try {
-      res = await fetch('/api/chat', {
+      res = await this.authFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           query,
           notebookId,
           documentId,
-          userId: uid,
           history,
         }),
       });
     } catch (err: any) {
+      if (err instanceof ApiError) throw err;
       throw new ApiError(
         err?.message || 'Unable to connect to the StudyAI Tutor server. Please check your connection and try again.',
         'NETWORK_ERROR',
@@ -1371,21 +1484,30 @@ class ApiService {
   }
 
   async deleteDocumentFromBackend(documentId: string, notebookId: string): Promise<void> {
-    const uid = this.getActiveUserId();
-    const userQuery = uid && uid !== 'guest' ? `?userId=${encodeURIComponent(uid)}` : '';
-    try {
-      await fetch(`/api/documents/${encodeURIComponent(documentId)}${userQuery}`, { method: 'DELETE' });
-    } catch (e) {
-      console.warn('Backend delete document failed:', e);
+    const res = await this.authFetch(`/api/documents/${encodeURIComponent(documentId)}`, {
+      method: 'DELETE',
+    });
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to delete document.');
     }
-    this.deleteDocument(notebookId, documentId);
+
+    this.notebooks = this.notebooks.map((nb) => {
+      if (nb.id === notebookId) {
+        const remaining = nb.documents.filter((d) => d.id !== documentId);
+        return {
+          ...nb,
+          documentsCount: remaining.length,
+          documents: remaining,
+        };
+      }
+      return nb;
+    });
+    delete this.docSummaries[documentId];
   }
 
   async fetchDocumentChunks(documentId: string): Promise<any[]> {
-    const uid = this.getActiveUserId();
-    const userQuery = uid && uid !== 'guest' ? `?userId=${encodeURIComponent(uid)}` : '';
     try {
-      const res = await fetch(`/api/documents/${encodeURIComponent(documentId)}/chunks${userQuery}`);
+      const res = await this.authFetch(`/api/documents/${encodeURIComponent(documentId)}/chunks`);
       const contentType = res.headers.get('content-type') || '';
       if (res.ok && contentType.includes('application/json')) {
         const data = await res.json();
@@ -1397,43 +1519,12 @@ class ApiService {
     return [];
   }
 
-  clearAllLoginData(): void {
-    try {
-      localStorage.removeItem(STORAGE_KEYS.AUTH);
-      localStorage.removeItem(STORAGE_KEYS.PROFILE);
-      localStorage.removeItem(STORAGE_KEYS.USERS);
-      localStorage.removeItem(STORAGE_KEYS.REMEMBER_EMAIL);
-    } catch (e) {
-      console.warn('Failed clearing login data:', e);
-    }
-  }
-
   async clearAllData(): Promise<void> {
-    // 1. Call backend to clear documents, chunks, vectors, and physical storage
-    try {
-      await fetch('/api/documents/clear-all', { method: 'POST' });
-    } catch (e) {
-      console.warn('Backend clear-all endpoint error:', e);
+    const res = await this.authFetch('/api/documents/clear-all', { method: 'POST' });
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to wipe user account data.');
     }
-
-    // 2. Clear ALL browser local state keys including auth, profile, and users
-    try {
-      const theme = localStorage.getItem('study_ai_theme');
-      const keysToRemove: string[] = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && (k.startsWith('studyai_') || (k.startsWith('study_ai_') && k !== 'study_ai_theme'))) {
-          keysToRemove.push(k);
-        }
-      }
-      keysToRemove.forEach((k) => localStorage.removeItem(k));
-      if (theme) {
-        localStorage.setItem('study_ai_theme', theme);
-      }
-      localStorage.setItem('studyai_zero_data_v3', 'purged');
-    } catch (e) {
-      console.warn('Failed clearing client storage:', e);
-    }
+    await this.logout();
   }
 }
 

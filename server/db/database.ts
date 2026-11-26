@@ -1,7 +1,19 @@
-import fs from 'fs';
-import path from 'path';
-import { config } from '../config';
-import { DocumentRecord, DocumentChunk, DocumentSummaryRecord, ChatSummaryRecord } from './models';
+import { PoolClient } from 'pg';
+import {
+  ChatMessageRecord,
+  ChatSummaryRecord,
+  DocumentChunk,
+  DocumentMetrics,
+  DocumentRecord,
+  DocumentStatus,
+  DocumentSummaryRecord,
+  ExamResultRecord,
+  NotebookRecord,
+  ProcessingJobRecord,
+  RecentActivityRecord,
+  UserProfileRecord,
+} from './models';
+import { formatVectorLiteral, pgQuery, withTransaction } from './supabaseClient';
 
 export function isValidEntityId(value: unknown): value is string {
   if (typeof value !== 'string') return false;
@@ -15,362 +27,997 @@ export function isValidEntityId(value: unknown): value is string {
   );
 }
 
-class Database {
-  private docsFile: string;
-  private chunksFile: string;
-  private summariesFile: string;
-  private documents: Map<string, DocumentRecord> = new Map();
-  private chunks: Map<string, DocumentChunk[]> = new Map(); // docId -> DocumentChunk[]
-  private docSummaries: Map<string, DocumentSummaryRecord> = new Map(); // docId -> DocumentSummaryRecord
-  private chatSummaries: Map<string, ChatSummaryRecord> = new Map(); // notebookId -> ChatSummaryRecord
+function mapDocumentRow(row: any): DocumentRecord {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    notebookId: row.notebook_id,
+    originalFileName: row.original_file_name,
+    storageFileName: row.storage_file_name,
+    storagePath: row.storage_path,
+    mimeType: row.mime_type,
+    fileSize: Number(row.file_size || 0),
+    fileHash: row.file_hash || undefined,
+    uploadDate: row.upload_date ? new Date(row.upload_date).toISOString() : new Date().toISOString(),
+    status: row.status as DocumentStatus,
+    currentStage: row.current_stage,
+    progress: Number(row.progress || 0),
+    message: row.message || '',
+    processedPages: Number(row.processed_pages || 0),
+    totalPages: Number(row.total_pages || 1),
+    chunkCount: Number(row.chunk_count || 0),
+    error: row.error || null,
+    metrics: (row.metrics as DocumentMetrics | null) || undefined,
+  };
+}
 
-  constructor() {
-    this.docsFile = path.join(config.DB_DIR, 'documents.json');
-    this.chunksFile = path.join(config.DB_DIR, 'chunks.json');
-    this.summariesFile = path.join(config.DB_DIR, 'summaries.json');
-    this.init();
-  }
+function mapChunkRow(row: any): DocumentChunk {
+  return {
+    id: row.id,
+    documentId: row.document_id,
+    userId: row.user_id,
+    notebookId: row.notebook_id,
+    chunkIndex: Number(row.chunk_index || 0),
+    pageStart: Number(row.page_start || 1),
+    pageEnd: Number(row.page_end || 1),
+    section: row.section || '',
+    heading: row.heading || '',
+    text: row.text,
+    tokenEstimate: Number(row.token_estimate || 0),
+    extractionMethod: row.extraction_method === 'ocr' ? 'ocr' : 'text',
+    sourceDocName: row.source_doc_name,
+  };
+}
 
-  private init() {
-    try {
-      if (!fs.existsSync(config.DATA_DIR)) fs.mkdirSync(config.DATA_DIR, { recursive: true });
-      if (!fs.existsSync(config.STORAGE_DIR)) fs.mkdirSync(config.STORAGE_DIR, { recursive: true });
-      if (!fs.existsSync(config.VECTOR_DB_DIR)) fs.mkdirSync(config.VECTOR_DB_DIR, { recursive: true });
-      if (!fs.existsSync(config.DB_DIR)) fs.mkdirSync(config.DB_DIR, { recursive: true });
+function mapJobRow(row: any): ProcessingJobRecord {
+  return {
+    id: row.id,
+    documentId: row.document_id,
+    userId: row.user_id,
+    notebookId: row.notebook_id,
+    status: row.status,
+    provider: row.provider,
+    qstashMessageId: row.qstash_message_id || null,
+    attempts: Number(row.attempts || 0),
+    maxAttempts: Number(row.max_attempts || 3),
+    lastError: row.last_error || null,
+    lockedAt: row.locked_at ? new Date(row.locked_at).toISOString() : null,
+    startedAt: row.started_at ? new Date(row.started_at).toISOString() : null,
+    completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : null,
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : undefined,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : undefined,
+  };
+}
 
-      if (fs.existsSync(this.docsFile)) {
-        const raw = fs.readFileSync(this.docsFile, 'utf-8');
-        const list: DocumentRecord[] = JSON.parse(raw);
-        if (Array.isArray(list)) {
-          list.forEach((doc) => {
-            if (
-              doc &&
-              isValidEntityId(doc.id) &&
-              isValidEntityId(doc.userId) &&
-              isValidEntityId(doc.notebookId)
-            ) {
-              this.documents.set(doc.id, doc);
-            } else {
-              console.warn('[Database] Skipped invalid document record on load:', doc?.originalFileName || doc);
-            }
-          });
-        }
-      }
-
-      if (fs.existsSync(this.chunksFile)) {
-        const raw = fs.readFileSync(this.chunksFile, 'utf-8');
-        const map: Record<string, DocumentChunk[]> = JSON.parse(raw);
-        if (map && typeof map === 'object') {
-          Object.entries(map).forEach(([docId, chks]) => {
-            if (!isValidEntityId(docId) || !Array.isArray(chks)) {
-              console.warn('[Database] Skipped invalid chunks key on load:', docId);
-              return;
-            }
-            const validChunks = chks.filter(
-              (c) =>
-                c &&
-                isValidEntityId(c.id) &&
-                isValidEntityId(c.documentId) &&
-                c.documentId === docId &&
-                isValidEntityId(c.userId) &&
-                isValidEntityId(c.notebookId)
-            );
-            if (validChunks.length > 0) {
-              this.chunks.set(docId, validChunks);
-            }
-          });
-        }
-      }
-
-      if (fs.existsSync(this.summariesFile)) {
-        const raw = fs.readFileSync(this.summariesFile, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (parsed.docSummaries && typeof parsed.docSummaries === 'object') {
-          Object.entries(parsed.docSummaries).forEach(([id, rec]) => {
-            const summary = rec as DocumentSummaryRecord;
-            if (
-              isValidEntityId(id) &&
-              summary &&
-              isValidEntityId(summary.documentId || id) &&
-              isValidEntityId(summary.notebookId)
-            ) {
-              this.docSummaries.set(id, { ...summary, documentId: summary.documentId || id });
-            } else {
-              console.warn('[Database] Skipped invalid document summary on load:', id);
-            }
-          });
-        }
-        if (parsed.chatSummaries && typeof parsed.chatSummaries === 'object') {
-          Object.entries(parsed.chatSummaries).forEach(([nbId, rec]) => {
-            const summary = rec as ChatSummaryRecord;
-            if (isValidEntityId(nbId) && summary && isValidEntityId(summary.notebookId || nbId)) {
-              this.chatSummaries.set(nbId, { ...summary, notebookId: summary.notebookId || nbId });
-            } else {
-              console.warn('[Database] Skipped invalid chat summary on load:', nbId);
-            }
-          });
-        }
-      }
-    } catch (err) {
-      console.error('Database init error:', err);
-    }
-  }
-
-  private saveDocuments() {
-    try {
-      const list = Array.from(this.documents.values());
-      fs.writeFileSync(this.docsFile, JSON.stringify(list, null, 2), 'utf-8');
-    } catch (err) {
-      console.error('Failed to save documents to disk:', err);
-    }
-  }
-
-  private saveChunks() {
-    try {
-      const obj: Record<string, DocumentChunk[]> = {};
-      this.chunks.forEach((val, key) => {
-        if (isValidEntityId(key)) {
-          obj[key] = val;
-        }
-      });
-      fs.writeFileSync(this.chunksFile, JSON.stringify(obj, null, 2), 'utf-8');
-    } catch (err) {
-      console.error('Failed to save chunks to disk:', err);
-    }
-  }
-
-  private saveSummaries() {
-    try {
-      const docObj: Record<string, DocumentSummaryRecord> = {};
-      this.docSummaries.forEach((val, key) => {
-        if (isValidEntityId(key)) {
-          docObj[key] = val;
-        }
-      });
-      const chatObj: Record<string, ChatSummaryRecord> = {};
-      this.chatSummaries.forEach((val, key) => {
-        if (isValidEntityId(key)) {
-          chatObj[key] = val;
-        }
-      });
-      fs.writeFileSync(
-        this.summariesFile,
-        JSON.stringify({ docSummaries: docObj, chatSummaries: chatObj }, null, 2),
-        'utf-8'
-      );
-    } catch (err) {
-      console.error('Failed to save summaries to disk:', err);
-    }
-  }
-
-  // Document operations
-  createDocument(doc: Partial<DocumentRecord> & { originalFileName: string; storagePath: string }): DocumentRecord {
-    const id = doc.id || `doc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    if (!isValidEntityId(id)) {
-      throw new Error('Cannot create document without a valid document ID.');
-    }
-    if (!isValidEntityId(doc.userId)) {
-      throw new Error('Cannot create document without a valid userId.');
-    }
-    if (!isValidEntityId(doc.notebookId)) {
-      throw new Error('Cannot create document without a valid notebookId.');
-    }
-
-    const fullDoc: DocumentRecord = {
-      id: id.trim(),
-      userId: doc.userId.trim(),
-      notebookId: doc.notebookId.trim(),
-      originalFileName: doc.originalFileName,
-      storageFileName: doc.storageFileName || path.basename(doc.storagePath),
-      storagePath: doc.storagePath,
-      mimeType: doc.mimeType || 'application/pdf',
-      fileSize: doc.fileSize || 0,
-      uploadDate: doc.uploadDate || new Date().toISOString(),
-      status: doc.status || 'UPLOADED',
-      currentStage: doc.currentStage || 'Uploaded',
-      progress: doc.progress || 20,
-      message: doc.message || 'Ready for processing',
-      processedPages: doc.processedPages || 0,
-      totalPages: doc.totalPages || 1,
-      chunkCount: doc.chunkCount || 0,
-      error: doc.error || null,
-      metrics: doc.metrics,
-    };
-    this.documents.set(fullDoc.id, fullDoc);
-    this.saveDocuments();
-    return fullDoc;
-  }
-
-  getDocument(id: string): DocumentRecord | undefined {
-    if (!isValidEntityId(id)) return undefined;
-    return this.documents.get(id);
-  }
-
-  getAllDocuments(userId?: string, notebookId?: string): DocumentRecord[] {
-    let list = Array.from(this.documents.values());
-    if (userId) {
-      list = list.filter((d) => d.userId === userId);
-    }
-    if (notebookId) {
-      list = list.filter((d) => d.notebookId === notebookId);
-    }
-    return list.sort((a, b) => new Date(b.uploadDate).getTime() - new Date(a.uploadDate).getTime());
-  }
-
-  updateDocument(id: string, updates: Partial<DocumentRecord>): DocumentRecord | undefined {
-    if (!isValidEntityId(id)) return undefined;
-    const existing = this.documents.get(id);
-    if (!existing) return undefined;
-    const updated = { ...existing, ...updates, id: existing.id };
-    this.documents.set(existing.id, updated);
-    this.saveDocuments();
-    return updated;
-  }
-
-  deleteDocument(id: string): boolean {
-    if (!isValidEntityId(id)) return false;
-    const doc = this.documents.get(id);
-    if (!doc) return false;
-
-    // Remove original file
-    try {
-      if (doc.storagePath && fs.existsSync(doc.storagePath)) {
-        fs.unlinkSync(doc.storagePath);
-      }
-    } catch (e) {
-      console.warn('Could not remove file on disk:', e);
-    }
-
-    this.documents.delete(id);
-    this.chunks.delete(id);
-    this.docSummaries.delete(id);
-    this.saveDocuments();
-    this.saveChunks();
-    this.saveSummaries();
-    return true;
-  }
-
-  // Chunks operations
-  saveDocumentChunks(documentId: string, chunks: DocumentChunk[]) {
-    if (!isValidEntityId(documentId)) {
-      throw new Error('Cannot save chunks without a valid documentId.');
-    }
-    const sanitized = chunks.filter(
-      (c) =>
-        c &&
-        isValidEntityId(c.id) &&
-        isValidEntityId(c.documentId) &&
-        c.documentId === documentId &&
-        isValidEntityId(c.userId) &&
-        isValidEntityId(c.notebookId)
+class PostgresDatabase {
+  // ============================================================
+  // USERS
+  // ============================================================
+  async getUserProfile(userId: string): Promise<UserProfileRecord | null> {
+    if (!isValidEntityId(userId)) return null;
+    const res = await pgQuery(
+      `SELECT id, email, name, avatar, degree, semester, university, created_at, updated_at
+       FROM public.users WHERE id = $1 LIMIT 1`,
+      [userId]
     );
-    if (sanitized.length !== chunks.length) {
-      throw new Error('One or more document chunks have invalid IDs or metadata.');
-    }
-    this.chunks.set(documentId, sanitized);
-    this.saveChunks();
+    if (!res.rows[0]) return null;
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      email: r.email,
+      name: r.name,
+      avatar: r.avatar || 'ST',
+      degree: r.degree,
+      semester: r.semester,
+      university: r.university,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    };
   }
 
-  getDocumentChunks(documentId: string): DocumentChunk[] {
-    if (!isValidEntityId(documentId)) return [];
-    return this.chunks.get(documentId) || [];
+  async updateUserProfile(
+    userId: string,
+    updates: Partial<Pick<UserProfileRecord, 'name' | 'degree' | 'semester' | 'university' | 'avatar'>>
+  ): Promise<UserProfileRecord | null> {
+    if (!isValidEntityId(userId)) return null;
+    const res = await pgQuery(
+      `UPDATE public.users
+       SET
+         name = COALESCE($2, name),
+         degree = COALESCE($3, degree),
+         semester = COALESCE($4, semester),
+         university = COALESCE($5, university),
+         avatar = COALESCE($6, avatar),
+         updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, email, name, avatar, degree, semester, university, created_at, updated_at`,
+      [
+        userId,
+        updates.name?.trim() || null,
+        updates.degree?.trim() || null,
+        updates.semester?.trim() || null,
+        updates.university?.trim() || null,
+        updates.avatar?.trim() || null,
+      ]
+    );
+    if (!res.rows[0]) return null;
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      email: r.email,
+      name: r.name,
+      avatar: r.avatar || 'ST',
+      degree: r.degree,
+      semester: r.semester,
+      university: r.university,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    };
   }
 
-  getAllChunksForUser(userId: string): DocumentChunk[] {
+  // ============================================================
+  // NOTEBOOKS
+  // ============================================================
+  async getNotebooks(userId: string): Promise<Array<NotebookRecord & { documents: DocumentRecord[]; documentsCount: number }>> {
     if (!isValidEntityId(userId)) return [];
-    const res: DocumentChunk[] = [];
-    this.chunks.forEach((chunkList) => {
-      chunkList.forEach((c) => {
-        if (c.userId === userId) res.push(c);
-      });
+    const nbRes = await pgQuery(
+      `SELECT id, user_id, title, code, description, icon_name, accent_color, progress, last_studied, created_at, updated_at
+       FROM public.notebooks
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+
+    const docsRes = await pgQuery(
+      `SELECT * FROM public.documents
+       WHERE user_id = $1
+       ORDER BY upload_date DESC`,
+      [userId]
+    );
+
+    const docsByNotebook = new Map<string, DocumentRecord[]>();
+    for (const row of docsRes.rows) {
+      const mapped = mapDocumentRow(row);
+      const list = docsByNotebook.get(mapped.notebookId) || [];
+      list.push(mapped);
+      docsByNotebook.set(mapped.notebookId, list);
+    }
+
+    return nbRes.rows.map((row) => {
+      const docs = docsByNotebook.get(row.id) || [];
+      return {
+        id: row.id,
+        userId: row.user_id,
+        title: row.title,
+        code: row.code || '',
+        description: row.description || '',
+        iconName: row.icon_name || 'BookOpen',
+        accentColor: row.accent_color || '#2563EB',
+        progress: Number(row.progress || 0),
+        lastStudied: row.last_studied || 'Just now',
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        documentsCount: docs.length,
+        documents: docs,
+      };
     });
-    return res;
   }
 
-  // Summary operations (Requirements #1, #2, #4)
-  saveDocumentSummary(summary: DocumentSummaryRecord): DocumentSummaryRecord {
-    const docId = summary.documentId || (summary as any).id;
-    if (!isValidEntityId(docId)) {
-      throw new Error('Cannot save document summary without a valid documentId.');
+  async getNotebook(notebookId: string, userId: string): Promise<NotebookRecord | null> {
+    if (!isValidEntityId(notebookId) || !isValidEntityId(userId)) return null;
+    const res = await pgQuery(
+      `SELECT id, user_id, title, code, description, icon_name, accent_color, progress, last_studied, created_at, updated_at
+       FROM public.notebooks
+       WHERE id = $1 AND user_id = $2
+       LIMIT 1`,
+      [notebookId, userId]
+    );
+    if (!res.rows[0]) return null;
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      userId: r.user_id,
+      title: r.title,
+      code: r.code || '',
+      description: r.description || '',
+      iconName: r.icon_name || 'BookOpen',
+      accentColor: r.accent_color || '#2563EB',
+      progress: Number(r.progress || 0),
+      lastStudied: r.last_studied || 'Just now',
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    };
+  }
+
+  async createNotebook(
+    userId: string,
+    input: { id?: string; title: string; code?: string; description?: string; iconName?: string; accentColor?: string }
+  ): Promise<NotebookRecord> {
+    if (!isValidEntityId(userId)) {
+      throw new Error('Valid authenticated userId is required.');
     }
-    if (!isValidEntityId(summary.notebookId)) {
-      throw new Error('Cannot save document summary without a valid notebookId.');
+    const id = input.id && isValidEntityId(input.id) ? input.id.trim() : `nb_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const title = (input.title || '').trim();
+    if (!title) {
+      throw new Error('Notebook title is required.');
     }
-    const record: DocumentSummaryRecord = { ...summary, documentId: docId.trim() };
-    this.docSummaries.set(record.documentId, record);
-    this.saveSummaries();
-    return record;
+
+    const res = await pgQuery(
+      `INSERT INTO public.notebooks (id, user_id, title, code, description, icon_name, accent_color, progress, last_studied)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'Just now')
+       RETURNING id, user_id, title, code, description, icon_name, accent_color, progress, last_studied, created_at, updated_at`,
+      [
+        id,
+        userId,
+        title,
+        (input.code || '').trim(),
+        (input.description || 'Custom study notebook for course preparation.').trim(),
+        input.iconName || 'BookOpen',
+        input.accentColor || '#2563EB',
+      ]
+    );
+
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      userId: r.user_id,
+      title: r.title,
+      code: r.code || '',
+      description: r.description || '',
+      iconName: r.icon_name || 'BookOpen',
+      accentColor: r.accent_color || '#2563EB',
+      progress: Number(r.progress || 0),
+      lastStudied: r.last_studied || 'Just now',
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    };
   }
 
-  getDocumentSummary(documentId: string): DocumentSummaryRecord | undefined {
-    if (!isValidEntityId(documentId)) return undefined;
-    return this.docSummaries.get(documentId);
-  }
+  async deleteNotebook(notebookId: string, userId: string): Promise<{ deleted: boolean; storagePaths: string[]; title?: string }> {
+    if (!isValidEntityId(notebookId) || !isValidEntityId(userId)) {
+      return { deleted: false, storagePaths: [] };
+    }
 
-  getAllDocumentSummaries(notebookId: string, userId?: string): DocumentSummaryRecord[] {
-    if (!isValidEntityId(notebookId)) return [];
-    const res: DocumentSummaryRecord[] = [];
-    this.docSummaries.forEach((sum) => {
-      if (sum.notebookId !== notebookId) return;
-      if (userId) {
-        if (sum.userId && sum.userId !== userId) return;
-        const doc = this.documents.get(sum.documentId);
-        if (doc && doc.userId !== userId) return;
+    return withTransaction(async (client: PoolClient) => {
+      const nbRes = await client.query<{ id: string; title: string }>(
+        `SELECT id, title FROM public.notebooks WHERE id = $1 AND user_id = $2`,
+        [notebookId, userId]
+      );
+      if (!nbRes.rows[0]) {
+        return { deleted: false, storagePaths: [] };
       }
-      res.push(sum);
+
+      const docsRes = await client.query<{ storage_path: string }>(
+        `SELECT storage_path FROM public.documents WHERE notebook_id = $1 AND user_id = $2`,
+        [notebookId, userId]
+      );
+      const storagePaths = docsRes.rows.map((r) => r.storage_path).filter(Boolean);
+
+      await client.query(`DELETE FROM public.notebooks WHERE id = $1 AND user_id = $2`, [notebookId, userId]);
+      return { deleted: true, storagePaths, title: nbRes.rows[0].title };
     });
-    return res;
   }
 
-  deleteDocumentSummary(documentId: string): boolean {
-    if (!isValidEntityId(documentId)) return false;
-    const deleted = this.docSummaries.delete(documentId);
-    if (deleted) {
-      this.saveSummaries();
-    }
-    return deleted;
+  // ============================================================
+  // DOCUMENTS & PROCESSING JOBS
+  // ============================================================
+  async findDuplicateDocument(userId: string, notebookId: string, fileHash: string): Promise<DocumentRecord | null> {
+    if (!isValidEntityId(userId) || !isValidEntityId(notebookId) || !fileHash) return null;
+    const res = await pgQuery(
+      `SELECT * FROM public.documents
+       WHERE user_id = $1 AND notebook_id = $2 AND file_hash = $3
+       LIMIT 1`,
+      [userId, notebookId, fileHash]
+    );
+    return res.rows[0] ? mapDocumentRow(res.rows[0]) : null;
   }
 
-  saveChatSummary(summary: ChatSummaryRecord): ChatSummaryRecord {
-    if (!isValidEntityId(summary.notebookId)) {
-      throw new Error('Cannot save chat summary without a valid notebookId.');
+  async createDocumentWithJob(
+    doc: DocumentRecord,
+    job: Pick<ProcessingJobRecord, 'id' | 'provider' | 'qstashMessageId'>
+  ): Promise<{ document: DocumentRecord; job: ProcessingJobRecord }> {
+    if (!isValidEntityId(doc.id) || !isValidEntityId(doc.userId) || !isValidEntityId(doc.notebookId)) {
+      throw new Error('Cannot create document without valid IDs.');
     }
-    if (!isValidEntityId(summary.userId)) {
-      throw new Error('Cannot save chat summary without a valid userId.');
-    }
-    this.chatSummaries.set(summary.notebookId, summary);
-    this.saveSummaries();
-    return summary;
+
+    return withTransaction(async (client: PoolClient) => {
+      // Verify notebook belongs to user
+      const nbCheck = await client.query(
+        `SELECT id FROM public.notebooks WHERE id = $1 AND user_id = $2 LIMIT 1`,
+        [doc.notebookId, doc.userId]
+      );
+      if (!nbCheck.rows[0]) {
+        throw new Error('Selected notebook was not found for your account.');
+      }
+
+      const docRes = await client.query(
+        `INSERT INTO public.documents (
+           id, user_id, notebook_id, original_file_name, storage_file_name, storage_path,
+           mime_type, file_size, file_hash, upload_date, status, current_stage, progress,
+           message, processed_pages, total_pages, chunk_count, error, metrics
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6,
+           $7, $8, $9, $10, $11, $12, $13,
+           $14, $15, $16, $17, $18, $19::jsonb
+         )
+         RETURNING *`,
+        [
+          doc.id.trim(),
+          doc.userId.trim(),
+          doc.notebookId.trim(),
+          doc.originalFileName,
+          doc.storageFileName,
+          doc.storagePath,
+          doc.mimeType || 'application/pdf',
+          doc.fileSize || 0,
+          doc.fileHash || null,
+          doc.uploadDate || new Date().toISOString(),
+          doc.status || 'UPLOADED',
+          doc.currentStage || 'Document uploaded and queued',
+          doc.progress ?? 20,
+          doc.message || 'Queued for background processing',
+          doc.processedPages ?? 0,
+          doc.totalPages ?? 1,
+          doc.chunkCount ?? 0,
+          doc.error || null,
+          doc.metrics ? JSON.stringify(doc.metrics) : null,
+        ]
+      );
+
+      const jobRes = await client.query(
+        `INSERT INTO public.processing_jobs (
+           id, document_id, user_id, notebook_id, status, provider, qstash_message_id, attempts, max_attempts
+         ) VALUES ($1, $2, $3, $4, 'QUEUED', $5, $6, 0, 3)
+         RETURNING *`,
+        [job.id, doc.id.trim(), doc.userId.trim(), doc.notebookId.trim(), job.provider, job.qstashMessageId || null]
+      );
+
+      return {
+        document: mapDocumentRow(docRes.rows[0]),
+        job: mapJobRow(jobRes.rows[0]),
+      };
+    });
   }
 
-  getChatSummary(notebookId: string, userId?: string): ChatSummaryRecord | undefined {
-    if (!isValidEntityId(notebookId)) return undefined;
-    const summary = this.chatSummaries.get(notebookId);
-    if (!summary) return undefined;
-    if (userId && summary.userId && summary.userId !== userId) {
-      return undefined;
-    }
-    return summary;
+  async getDocument(id: string, userId?: string): Promise<DocumentRecord | undefined> {
+    if (!isValidEntityId(id)) return undefined;
+    const res = userId
+      ? await pgQuery(`SELECT * FROM public.documents WHERE id = $1 AND user_id = $2 LIMIT 1`, [id, userId])
+      : await pgQuery(`SELECT * FROM public.documents WHERE id = $1 LIMIT 1`, [id]);
+    return res.rows[0] ? mapDocumentRow(res.rows[0]) : undefined;
   }
 
-  clearChatSummary(notebookId: string): boolean {
-    if (!isValidEntityId(notebookId)) return false;
-    const deleted = this.chatSummaries.delete(notebookId);
-    if (deleted) {
-      this.saveSummaries();
-    }
-    return deleted;
+  async getAllDocuments(userId: string, notebookId?: string): Promise<DocumentRecord[]> {
+    if (!isValidEntityId(userId)) return [];
+    const res = notebookId
+      ? await pgQuery(
+          `SELECT * FROM public.documents WHERE user_id = $1 AND notebook_id = $2 ORDER BY upload_date DESC`,
+          [userId, notebookId]
+        )
+      : await pgQuery(
+          `SELECT * FROM public.documents WHERE user_id = $1 ORDER BY upload_date DESC`,
+          [userId]
+        );
+    return res.rows.map(mapDocumentRow);
   }
 
-  clearAll() {
-    this.documents.clear();
-    this.chunks.clear();
-    this.docSummaries.clear();
-    this.chatSummaries.clear();
-    this.saveDocuments();
-    this.saveChunks();
-    this.saveSummaries();
+  async updateDocument(id: string, updates: Partial<DocumentRecord>): Promise<DocumentRecord | undefined> {
+    if (!isValidEntityId(id)) return undefined;
+    const res = await pgQuery(
+      `UPDATE public.documents
+       SET
+         status = COALESCE($2, status),
+         current_stage = COALESCE($3, current_stage),
+         progress = COALESCE($4, progress),
+         message = COALESCE($5, message),
+         processed_pages = COALESCE($6, processed_pages),
+         total_pages = COALESCE($7, total_pages),
+         chunk_count = COALESCE($8, chunk_count),
+         error = CASE WHEN $9::boolean THEN $10 ELSE error END,
+         metrics = COALESCE($11::jsonb, metrics),
+         updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [
+        id,
+        updates.status ?? null,
+        updates.currentStage ?? null,
+        updates.progress !== undefined ? updates.progress : null,
+        updates.message ?? null,
+        updates.processedPages !== undefined ? updates.processedPages : null,
+        updates.totalPages !== undefined ? updates.totalPages : null,
+        updates.chunkCount !== undefined ? updates.chunkCount : null,
+        updates.error !== undefined,
+        updates.error ?? null,
+        updates.metrics ? JSON.stringify(updates.metrics) : null,
+      ]
+    );
+    return res.rows[0] ? mapDocumentRow(res.rows[0]) : undefined;
+  }
+
+  async deleteDocument(id: string, userId: string): Promise<{ deleted: boolean; storagePath?: string; fileName?: string }> {
+    if (!isValidEntityId(id) || !isValidEntityId(userId)) return { deleted: false };
+    const res = await pgQuery<{ storage_path: string; original_file_name: string }>(
+      `DELETE FROM public.documents
+       WHERE id = $1 AND user_id = $2
+       RETURNING storage_path, original_file_name`,
+      [id, userId]
+    );
+    if (!res.rows[0]) return { deleted: false };
+    return {
+      deleted: true,
+      storagePath: res.rows[0].storage_path,
+      fileName: res.rows[0].original_file_name,
+    };
+  }
+
+  // ============================================================
+  // PROCESSING JOBS
+  // ============================================================
+  async claimProcessingJob(documentId: string): Promise<ProcessingJobRecord | null> {
+    if (!isValidEntityId(documentId)) return null;
+    const res = await pgQuery(
+      `UPDATE public.processing_jobs
+       SET
+         status = 'RUNNING',
+         attempts = attempts + 1,
+         locked_at = NOW(),
+         started_at = COALESCE(started_at, NOW()),
+         updated_at = NOW()
+       WHERE id = (
+         SELECT id FROM public.processing_jobs
+         WHERE document_id = $1 AND status IN ('QUEUED', 'FAILED')
+         ORDER BY created_at DESC
+         LIMIT 1
+       )
+       RETURNING *`,
+      [documentId]
+    );
+    return res.rows[0] ? mapJobRow(res.rows[0]) : null;
+  }
+
+  async createOrResetRetryJob(
+    doc: DocumentRecord,
+    provider: 'qstash' | 'inline' | 'local'
+  ): Promise<ProcessingJobRecord> {
+    return withTransaction(async (client: PoolClient) => {
+      const active = await client.query(
+        `SELECT * FROM public.processing_jobs
+         WHERE document_id = $1 AND status IN ('QUEUED', 'RUNNING')
+         LIMIT 1`,
+        [doc.id]
+      );
+      if (active.rows[0]) {
+        return mapJobRow(active.rows[0]);
+      }
+
+      const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const res = await client.query(
+        `INSERT INTO public.processing_jobs (
+           id, document_id, user_id, notebook_id, status, provider, attempts, max_attempts
+         ) VALUES ($1, $2, $3, $4, 'QUEUED', $5, 0, 3)
+         RETURNING *`,
+        [jobId, doc.id, doc.userId, doc.notebookId, provider]
+      );
+
+      await client.query(
+        `UPDATE public.documents
+         SET status = 'UPLOADED',
+             current_stage = 'Queued for retry',
+             progress = 20,
+             message = 'Document re-queued for background processing...',
+             error = NULL,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [doc.id]
+      );
+
+      return mapJobRow(res.rows[0]);
+    });
+  }
+
+  async updateJobProviderRef(jobId: string, provider: 'qstash' | 'inline' | 'local', qstashMessageId?: string): Promise<void> {
+    await pgQuery(
+      `UPDATE public.processing_jobs
+       SET provider = $2, qstash_message_id = COALESCE($3, qstash_message_id), updated_at = NOW()
+       WHERE id = $1`,
+      [jobId, provider, qstashMessageId || null]
+    );
+  }
+
+  async completeProcessingJob(jobId: string): Promise<void> {
+    await pgQuery(
+      `UPDATE public.processing_jobs
+       SET status = 'COMPLETED', completed_at = NOW(), last_error = NULL, updated_at = NOW()
+       WHERE id = $1`,
+      [jobId]
+    );
+  }
+
+  async failProcessingJob(jobId: string, errorMessage: string): Promise<void> {
+    await pgQuery(
+      `UPDATE public.processing_jobs
+       SET status = 'FAILED', last_error = $2, updated_at = NOW()
+       WHERE id = $1`,
+      [jobId, errorMessage.slice(0, 1000)]
+    );
+  }
+
+  async getLatestProcessingJob(documentId: string, userId: string): Promise<ProcessingJobRecord | null> {
+    if (!isValidEntityId(documentId) || !isValidEntityId(userId)) return null;
+    const res = await pgQuery(
+      `SELECT * FROM public.processing_jobs
+       WHERE document_id = $1 AND user_id = $2
+       ORDER BY created_at DESC LIMIT 1`,
+      [documentId, userId]
+    );
+    return res.rows[0] ? mapJobRow(res.rows[0]) : null;
+  }
+
+  // ============================================================
+  // CHUNKS & VECTOR EMBEDDINGS (TRANSACTIONAL)
+  // ============================================================
+  async saveDocumentChunksAndVectors(
+    documentId: string,
+    userId: string,
+    notebookId: string,
+    chunks: DocumentChunk[],
+    vectors: number[][]
+  ): Promise<void> {
+    if (!isValidEntityId(documentId) || !isValidEntityId(userId) || !isValidEntityId(notebookId)) {
+      throw new Error('Valid documentId, userId, and notebookId are required to store chunks.');
+    }
+    if (chunks.length !== vectors.length) {
+      throw new Error('Chunk count and embedding vector count mismatch.');
+    }
+
+    await withTransaction(async (client: PoolClient) => {
+      // Remove existing chunks/vectors for idempotency on retry
+      await client.query(`DELETE FROM public.vector_embeddings WHERE document_id = $1`, [documentId]);
+      await client.query(`DELETE FROM public.document_chunks WHERE document_id = $1`, [documentId]);
+
+      for (let i = 0; i < chunks.length; i++) {
+        const c = chunks[i];
+        const vecLiteral = formatVectorLiteral(vectors[i]);
+
+        await client.query(
+          `INSERT INTO public.document_chunks (
+             id, document_id, user_id, notebook_id, chunk_index,
+             page_start, page_end, section, heading, text,
+             token_estimate, extraction_method, source_doc_name
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          [
+            c.id,
+            documentId,
+            userId,
+            notebookId,
+            c.chunkIndex,
+            c.pageStart,
+            c.pageEnd,
+            c.section || '',
+            c.heading || '',
+            c.text,
+            c.tokenEstimate,
+            c.extractionMethod === 'ocr' ? 'ocr' : 'text',
+            c.sourceDocName,
+          ]
+        );
+
+        await client.query(
+          `INSERT INTO public.vector_embeddings (
+             chunk_id, document_id, user_id, notebook_id, embedding
+           ) VALUES ($1, $2, $3, $4, $5::vector)`,
+          [c.id, documentId, userId, notebookId, vecLiteral]
+        );
+      }
+    });
+  }
+
+  async getDocumentChunks(documentId: string, userId?: string): Promise<DocumentChunk[]> {
+    if (!isValidEntityId(documentId)) return [];
+    const res = userId
+      ? await pgQuery(
+          `SELECT * FROM public.document_chunks WHERE document_id = $1 AND user_id = $2 ORDER BY chunk_index ASC`,
+          [documentId, userId]
+        )
+      : await pgQuery(
+          `SELECT * FROM public.document_chunks WHERE document_id = $1 ORDER BY chunk_index ASC`,
+          [documentId]
+        );
+    return res.rows.map(mapChunkRow);
+  }
+
+  async deleteVectorsByDocumentId(documentId: string, userId?: string): Promise<number> {
+    if (!isValidEntityId(documentId)) return 0;
+    const res = userId
+      ? await pgQuery(`DELETE FROM public.vector_embeddings WHERE document_id = $1 AND user_id = $2`, [
+          documentId,
+          userId,
+        ])
+      : await pgQuery(`DELETE FROM public.vector_embeddings WHERE document_id = $1`, [documentId]);
+    return res.rowCount || 0;
+  }
+
+  async getVectorCountForUser(userId: string): Promise<number> {
+    if (!isValidEntityId(userId)) return 0;
+    const res = await pgQuery<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM public.vector_embeddings WHERE user_id = $1`,
+      [userId]
+    );
+    return Number(res.rows[0]?.count || 0);
+  }
+
+  // ============================================================
+  // CHAT MESSAGES
+  // ============================================================
+  async getChatMessages(notebookId: string, userId: string): Promise<ChatMessageRecord[]> {
+    if (!isValidEntityId(notebookId) || !isValidEntityId(userId)) return [];
+    const res = await pgQuery(
+      `SELECT * FROM public.chat_messages
+       WHERE notebook_id = $1 AND user_id = $2
+       ORDER BY created_at ASC`,
+      [notebookId, userId]
+    );
+    return res.rows.map((r) => ({
+      id: r.id,
+      userId: r.user_id,
+      notebookId: r.notebook_id,
+      sender: r.sender,
+      text: r.text,
+      timestamp: r.timestamp_label,
+      sourceReferences: r.source_references || [],
+      isGrounded: Boolean(r.is_grounded),
+      retrievalScore: Number(r.retrieval_score || 0),
+      insufficientInfo: Boolean(r.insufficient_info),
+    }));
+  }
+
+  async saveChatMessage(msg: ChatMessageRecord): Promise<ChatMessageRecord> {
+    if (!isValidEntityId(msg.id) || !isValidEntityId(msg.userId) || !isValidEntityId(msg.notebookId)) {
+      throw new Error('Valid chat message ID, userId, and notebookId are required.');
+    }
+    const res = await pgQuery(
+      `INSERT INTO public.chat_messages (
+         id, user_id, notebook_id, sender, text, timestamp_label,
+         source_references, is_grounded, retrieval_score, insufficient_info
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)
+       ON CONFLICT (id) DO UPDATE SET
+         text = EXCLUDED.text,
+         source_references = EXCLUDED.source_references,
+         is_grounded = EXCLUDED.is_grounded,
+         retrieval_score = EXCLUDED.retrieval_score,
+         insufficient_info = EXCLUDED.insufficient_info
+       RETURNING *`,
+      [
+        msg.id,
+        msg.userId,
+        msg.notebookId,
+        msg.sender,
+        msg.text,
+        msg.timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        JSON.stringify(msg.sourceReferences || []),
+        Boolean(msg.isGrounded),
+        msg.retrievalScore || 0,
+        Boolean(msg.insufficientInfo),
+      ]
+    );
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      userId: r.user_id,
+      notebookId: r.notebook_id,
+      sender: r.sender,
+      text: r.text,
+      timestamp: r.timestamp_label,
+      sourceReferences: r.source_references || [],
+      isGrounded: Boolean(r.is_grounded),
+      retrievalScore: Number(r.retrieval_score || 0),
+      insufficientInfo: Boolean(r.insufficient_info),
+    };
+  }
+
+  async clearChatMessages(notebookId: string, userId: string): Promise<void> {
+    if (!isValidEntityId(notebookId) || !isValidEntityId(userId)) return;
+    await pgQuery(`DELETE FROM public.chat_messages WHERE notebook_id = $1 AND user_id = $2`, [
+      notebookId,
+      userId,
+    ]);
+  }
+
+  // ============================================================
+  // SUMMARIES
+  // ============================================================
+  async saveDocumentSummary(summary: DocumentSummaryRecord): Promise<DocumentSummaryRecord> {
+    const docId = summary.documentId;
+    if (!isValidEntityId(docId) || !isValidEntityId(summary.notebookId) || !isValidEntityId(summary.userId)) {
+      throw new Error('Valid documentId, notebookId, and userId are required.');
+    }
+
+    const res = await pgQuery(
+      `INSERT INTO public.document_summaries (
+         document_id, user_id, notebook_id, original_file_name, summary,
+         page_count, file_size, source_chunk_count, generated_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+       ON CONFLICT (document_id) DO UPDATE SET
+         summary = EXCLUDED.summary,
+         page_count = EXCLUDED.page_count,
+         file_size = EXCLUDED.file_size,
+         source_chunk_count = EXCLUDED.source_chunk_count,
+         generated_at = EXCLUDED.generated_at,
+         updated_at = NOW()
+       RETURNING *`,
+      [
+        docId,
+        summary.userId,
+        summary.notebookId,
+        summary.originalFileName,
+        summary.summary,
+        summary.pageCount || 1,
+        summary.fileSize || null,
+        summary.sourceChunkCount || 0,
+        summary.generatedAt,
+      ]
+    );
+    const r = res.rows[0];
+    return {
+      documentId: r.document_id,
+      userId: r.user_id,
+      notebookId: r.notebook_id,
+      originalFileName: r.original_file_name,
+      summary: r.summary,
+      pageCount: Number(r.page_count || 1),
+      fileSize: r.file_size || undefined,
+      generatedAt: r.generated_at,
+      sourceChunkCount: Number(r.source_chunk_count || 0),
+    };
+  }
+
+  async getDocumentSummary(documentId: string, userId?: string): Promise<DocumentSummaryRecord | undefined> {
+    if (!isValidEntityId(documentId)) return undefined;
+    const res = userId
+      ? await pgQuery(`SELECT * FROM public.document_summaries WHERE document_id = $1 AND user_id = $2 LIMIT 1`, [
+          documentId,
+          userId,
+        ])
+      : await pgQuery(`SELECT * FROM public.document_summaries WHERE document_id = $1 LIMIT 1`, [documentId]);
+    if (!res.rows[0]) return undefined;
+    const r = res.rows[0];
+    return {
+      documentId: r.document_id,
+      userId: r.user_id,
+      notebookId: r.notebook_id,
+      originalFileName: r.original_file_name,
+      summary: r.summary,
+      pageCount: Number(r.page_count || 1),
+      fileSize: r.file_size || undefined,
+      generatedAt: r.generated_at,
+      sourceChunkCount: Number(r.source_chunk_count || 0),
+    };
+  }
+
+  async getAllDocumentSummaries(notebookId: string, userId: string): Promise<DocumentSummaryRecord[]> {
+    if (!isValidEntityId(notebookId) || !isValidEntityId(userId)) return [];
+    const res = await pgQuery(
+      `SELECT * FROM public.document_summaries WHERE notebook_id = $1 AND user_id = $2`,
+      [notebookId, userId]
+    );
+    return res.rows.map((r) => ({
+      documentId: r.document_id,
+      userId: r.user_id,
+      notebookId: r.notebook_id,
+      originalFileName: r.original_file_name,
+      summary: r.summary,
+      pageCount: Number(r.page_count || 1),
+      fileSize: r.file_size || undefined,
+      generatedAt: r.generated_at,
+      sourceChunkCount: Number(r.source_chunk_count || 0),
+    }));
+  }
+
+  async saveChatSummary(summary: ChatSummaryRecord): Promise<ChatSummaryRecord> {
+    if (!isValidEntityId(summary.notebookId) || !isValidEntityId(summary.userId)) {
+      throw new Error('Valid notebookId and userId are required.');
+    }
+
+    const res = await pgQuery(
+      `INSERT INTO public.chat_summaries (
+         notebook_id, user_id, summary, generated_at, message_count, last_message_id, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       ON CONFLICT (notebook_id) DO UPDATE SET
+         summary = EXCLUDED.summary,
+         generated_at = EXCLUDED.generated_at,
+         message_count = EXCLUDED.message_count,
+         last_message_id = EXCLUDED.last_message_id,
+         updated_at = NOW()
+       RETURNING *`,
+      [
+        summary.notebookId,
+        summary.userId,
+        summary.summary,
+        summary.generatedAt,
+        summary.messageCount || 0,
+        summary.lastMessageId || null,
+      ]
+    );
+    const r = res.rows[0];
+    return {
+      notebookId: r.notebook_id,
+      userId: r.user_id,
+      summary: r.summary,
+      generatedAt: r.generated_at,
+      messageCount: Number(r.message_count || 0),
+      lastMessageId: r.last_message_id || undefined,
+    };
+  }
+
+  async getChatSummary(notebookId: string, userId: string): Promise<ChatSummaryRecord | undefined> {
+    if (!isValidEntityId(notebookId) || !isValidEntityId(userId)) return undefined;
+    const res = await pgQuery(
+      `SELECT * FROM public.chat_summaries WHERE notebook_id = $1 AND user_id = $2 LIMIT 1`,
+      [notebookId, userId]
+    );
+    if (!res.rows[0]) return undefined;
+    const r = res.rows[0];
+    return {
+      notebookId: r.notebook_id,
+      userId: r.user_id,
+      summary: r.summary,
+      generatedAt: r.generated_at,
+      messageCount: Number(r.message_count || 0),
+      lastMessageId: r.last_message_id || undefined,
+    };
+  }
+
+  async clearChatSummary(notebookId: string, userId: string): Promise<boolean> {
+    if (!isValidEntityId(notebookId) || !isValidEntityId(userId)) return false;
+    const res = await pgQuery(`DELETE FROM public.chat_summaries WHERE notebook_id = $1 AND user_id = $2`, [
+      notebookId,
+      userId,
+    ]);
+    return (res.rowCount || 0) > 0;
+  }
+
+  // ============================================================
+  // EXAM RESULTS & RECENT ACTIVITY
+  // ============================================================
+  async saveExamResult(exam: ExamResultRecord): Promise<ExamResultRecord> {
+    return withTransaction(async (client: PoolClient) => {
+      await client.query(
+        `INSERT INTO public.exam_results (
+           id, user_id, notebook_id, notebook_title,
+           total_questions, correct_count, incorrect_count, skipped_count,
+           percentage, time_taken_seconds, topic_performance, strong_topics,
+           weak_topics, recommendation, review_questions
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15::jsonb)`,
+        [
+          exam.examId,
+          exam.userId,
+          exam.notebookId,
+          exam.notebookTitle,
+          exam.totalQuestions,
+          exam.correctCount,
+          exam.incorrectCount,
+          exam.skippedCount,
+          exam.percentage,
+          exam.timeTakenSeconds,
+          JSON.stringify(exam.topicPerformance || []),
+          JSON.stringify(exam.strongTopics || []),
+          JSON.stringify(exam.weakTopics || []),
+          exam.recommendation || '',
+          JSON.stringify(exam.reviewQuestions || []),
+        ]
+      );
+
+      await client.query(
+        `UPDATE public.notebooks
+         SET progress = LEAST(100, GREATEST(progress, $3)),
+             last_studied = 'Just now',
+             updated_at = NOW()
+         WHERE id = $1 AND user_id = $2`,
+        [exam.notebookId, exam.userId, exam.percentage]
+      );
+
+      return exam;
+    });
+  }
+
+  async getExamResults(userId: string): Promise<ExamResultRecord[]> {
+    if (!isValidEntityId(userId)) return [];
+    const res = await pgQuery(
+      `SELECT * FROM public.exam_results WHERE user_id = $1 ORDER BY created_at DESC`,
+      [userId]
+    );
+    return res.rows.map((r) => ({
+      examId: r.id,
+      userId: r.user_id,
+      notebookId: r.notebook_id,
+      notebookTitle: r.notebook_title,
+      totalQuestions: Number(r.total_questions),
+      correctCount: Number(r.correct_count),
+      incorrectCount: Number(r.incorrect_count),
+      skippedCount: Number(r.skipped_count),
+      percentage: Number(r.percentage),
+      timeTakenSeconds: Number(r.time_taken_seconds),
+      topicPerformance: r.topic_performance || [],
+      strongTopics: r.strong_topics || [],
+      weakTopics: r.weak_topics || [],
+      recommendation: r.recommendation || '',
+      reviewQuestions: r.review_questions || [],
+      createdAt: r.created_at,
+    }));
+  }
+
+  async addActivity(item: RecentActivityRecord): Promise<RecentActivityRecord> {
+    const id = item.id || `act_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const res = await pgQuery(
+      `INSERT INTO public.recent_activity (id, user_id, type, title, subtitle, timestamp_label, score, notebook_title)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        id,
+        item.userId,
+        item.type,
+        item.title,
+        item.subtitle,
+        item.timestamp || 'Just now',
+        item.score || null,
+        item.notebookTitle || 'Workspace',
+      ]
+    );
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      userId: r.user_id,
+      type: r.type,
+      title: r.title,
+      subtitle: r.subtitle,
+      timestamp: r.timestamp_label,
+      score: r.score || undefined,
+      notebookTitle: r.notebook_title,
+      createdAt: r.created_at,
+    };
+  }
+
+  async getRecentActivity(userId: string, limit: number = 25): Promise<RecentActivityRecord[]> {
+    if (!isValidEntityId(userId)) return [];
+    const res = await pgQuery(
+      `SELECT * FROM public.recent_activity WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
+      [userId, Math.max(1, Math.min(limit, 100))]
+    );
+    return res.rows.map((r) => ({
+      id: r.id,
+      userId: r.user_id,
+      type: r.type,
+      title: r.title,
+      subtitle: r.subtitle,
+      timestamp: r.timestamp_label,
+      score: r.score || undefined,
+      notebookTitle: r.notebook_title,
+      createdAt: r.created_at,
+    }));
+  }
+
+  async clearRecentActivity(userId: string): Promise<void> {
+    if (!isValidEntityId(userId)) return;
+    await pgQuery(`DELETE FROM public.recent_activity WHERE user_id = $1`, [userId]);
+  }
+
+  async clearAllUserData(userId: string): Promise<string[]> {
+    if (!isValidEntityId(userId)) return [];
+    return withTransaction(async (client: PoolClient) => {
+      const docsRes = await client.query<{ storage_path: string }>(
+        `SELECT storage_path FROM public.documents WHERE user_id = $1`,
+        [userId]
+      );
+      const storagePaths = docsRes.rows.map((r) => r.storage_path).filter(Boolean);
+
+      await client.query(`DELETE FROM public.recent_activity WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM public.exam_results WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM public.notebooks WHERE user_id = $1`, [userId]);
+
+      return storagePaths;
+    });
   }
 }
 
-export const db = new Database();
+export const db = new PostgresDatabase();

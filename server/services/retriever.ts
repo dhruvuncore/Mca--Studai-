@@ -11,7 +11,7 @@ export class Retriever {
 
     let effectiveDocumentId = options.documentId;
     if (options.documentId) {
-      const doc = db.getDocument(options.documentId);
+      const doc = await db.getDocument(options.documentId, options.userId);
       if (
         !doc ||
         doc.status !== 'COMPLETED' ||
@@ -22,11 +22,9 @@ export class Retriever {
       }
     }
 
-    // Query Embedding
     const queryVector = await embeddingService.embedQuery(query.trim());
 
-    // Hybrid similarity search strictly scoped to user & notebook
-    const results = vectorStore.similaritySearch(queryVector, {
+    const results = await vectorStore.similaritySearch(queryVector, {
       ...options,
       documentId: effectiveDocumentId,
       queryText: query.trim(),

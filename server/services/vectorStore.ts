@@ -1,8 +1,7 @@
-import fs from 'fs';
-import path from 'path';
 import { config } from '../config';
-import { VectorEntry, DocumentChunk, RetrievalResult } from '../db/models';
-import { isValidEntityId } from '../db/database';
+import { DocumentChunk, RetrievalResult } from '../db/models';
+import { db, isValidEntityId } from '../db/database';
+import { formatVectorLiteral, pgQuery } from '../db/supabaseClient';
 
 export interface SearchOptions {
   userId: string;
@@ -14,141 +13,30 @@ export interface SearchOptions {
 }
 
 export class VectorStore {
-  private storeFile: string;
-  private entries: Map<string, VectorEntry> = new Map();
-
-  constructor() {
-    this.storeFile = path.join(config.VECTOR_DB_DIR, 'vectors.json');
-    this.init();
-  }
-
-  private init() {
-    try {
-      if (!fs.existsSync(config.VECTOR_DB_DIR)) {
-        fs.mkdirSync(config.VECTOR_DB_DIR, { recursive: true });
-      }
-      if (fs.existsSync(this.storeFile)) {
-        const data = fs.readFileSync(this.storeFile, 'utf-8');
-        const list: VectorEntry[] = JSON.parse(data);
-        if (Array.isArray(list)) {
-          list.forEach((entry) => {
-            if (
-              entry &&
-              isValidEntityId(entry.id) &&
-              isValidEntityId(entry.documentId) &&
-              isValidEntityId(entry.userId) &&
-              isValidEntityId(entry.notebookId)
-            ) {
-              this.entries.set(entry.id, entry);
-            } else {
-              console.warn('[VectorStore] Skipped invalid vector entry on load:', entry?.id);
-            }
-          });
-        }
-      }
-    } catch (err) {
-      console.error('Failed to init VectorStore:', err);
-    }
-  }
-
-  private save() {
-    try {
-      const list = Array.from(this.entries.values()).filter(
-        (entry) =>
-          isValidEntityId(entry.id) &&
-          isValidEntityId(entry.documentId) &&
-          isValidEntityId(entry.userId) &&
-          isValidEntityId(entry.notebookId)
-      );
-      fs.writeFileSync(this.storeFile, JSON.stringify(list, null, 2), 'utf-8');
-    } catch (err) {
-      console.error('Failed to persist VectorStore to disk:', err);
-    }
-  }
-
   /**
-   * Idempotently upsert chunks with their embeddings.
-   * Requirement #21: Stable chunk IDs prevent duplicate vector creation on retry.
+   * Idempotently upsert chunks with their 128-dim embeddings into PostgreSQL + pgvector
+   * inside a single ACID transaction.
    */
   async upsertChunks(chunks: DocumentChunk[], vectors: number[][]): Promise<void> {
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const vector = vectors[i];
-
-      if (
-        !isValidEntityId(chunk.id) ||
-        !isValidEntityId(chunk.documentId) ||
-        !isValidEntityId(chunk.userId) ||
-        !isValidEntityId(chunk.notebookId)
-      ) {
-        throw new Error(`Refusing to index vector entry with invalid IDs: ${chunk.id}`);
-      }
-
-      const entry: VectorEntry = {
-        id: chunk.id,
-        documentId: chunk.documentId,
-        userId: chunk.userId,
-        notebookId: chunk.notebookId,
-        vector,
-        text: chunk.text,
-        metadata: {
-          pageStart: chunk.pageStart,
-          pageEnd: chunk.pageEnd,
-          section: chunk.section,
-          heading: chunk.heading,
-          extractionMethod: chunk.extractionMethod,
-          sourceDocName: chunk.sourceDocName,
-        },
-      };
-
-      this.entries.set(entry.id, entry);
-    }
-
-    this.save();
+    if (chunks.length === 0) return;
+    const { documentId, userId, notebookId } = chunks[0];
+    await db.saveDocumentChunksAndVectors(documentId, userId, notebookId, chunks, vectors);
   }
 
   /**
    * Complete vector cleanup when a document is deleted or reprocessed.
-   * Requirement #22: Remove associated vector database entries; leave no orphaned vectors.
    */
-  deleteByDocumentId(documentId: string): number {
-    if (!isValidEntityId(documentId)) return 0;
-    let deletedCount = 0;
-    const toDelete: string[] = [];
-
-    this.entries.forEach((entry, id) => {
-      if (entry.documentId === documentId) {
-        toDelete.push(id);
-      }
-    });
-
-    toDelete.forEach((id) => {
-      this.entries.delete(id);
-      deletedCount++;
-    });
-
-    if (deletedCount > 0) {
-      this.save();
-    }
-
-    return deletedCount;
+  async deleteByDocumentId(documentId: string, userId?: string): Promise<number> {
+    return db.deleteVectorsByDocumentId(documentId, userId);
   }
 
   /**
-   * Clears all vector entries.
-   */
-  clearAll(): void {
-    this.entries.clear();
-    this.save();
-  }
-
-  /**
-   * Hybrid similarity search combining dense vector cosine similarity (65%)
+   * Hybrid similarity search combining pgvector dense cosine similarity (65%)
    * and lexical keyword overlap (35%) with section & heading boosting.
-   * Strictly scoped to the requested userId and notebookId (and optional documentId).
+   * Strictly scoped to the authenticated userId and notebookId (and optional documentId).
    * NEVER falls back to documents from other notebooks or other users.
    */
-  similaritySearch(queryVector: number[], options: SearchOptions): RetrievalResult[] {
+  async similaritySearch(queryVector: number[], options: SearchOptions): Promise<RetrievalResult[]> {
     const {
       userId,
       documentId,
@@ -158,50 +46,75 @@ export class VectorStore {
       threshold = config.SIMILARITY_THRESHOLD,
     } = options;
 
-    // Require strict userId and notebookId (or explicit documentId) scoping
     if (!isValidEntityId(userId) || (!isValidEntityId(notebookId) && !isValidEntityId(documentId))) {
       return [];
     }
 
-    const candidates: { entry: VectorEntry; score: number }[] = [];
+    // Resolve notebookId if only documentId was provided
+    let effectiveNotebookId = notebookId;
+    if (!effectiveNotebookId && documentId) {
+      const doc = await db.getDocument(documentId, userId);
+      if (!doc) return [];
+      effectiveNotebookId = doc.notebookId;
+    }
+
+    if (!effectiveNotebookId) {
+      return [];
+    }
+
+    const vecLiteral = formatVectorLiteral(queryVector);
+    const fetchLimit = Math.max(topK * 5, 25);
+
+    const res = await pgQuery<{
+      chunk_id: string;
+      document_id: string;
+      user_id: string;
+      notebook_id: string;
+      chunk_index: number;
+      page_start: number;
+      page_end: number;
+      section: string;
+      heading: string;
+      text: string;
+      token_estimate: number;
+      extraction_method: string;
+      source_doc_name: string;
+      cosine_similarity: number;
+    }>(
+      `SELECT * FROM public.match_document_embeddings($1::uuid, $2::text, $3::text, $4::vector, $5::int)`,
+      [userId, effectiveNotebookId, documentId || null, vecLiteral, fetchLimit]
+    );
+
+    if (res.rows.length === 0) {
+      return [];
+    }
 
     // Pre-process query keywords for lexical scoring
     const stopWords = new Set([
       'a', 'an', 'the', 'is', 'are', 'was', 'were', 'what', 'which', 'who', 'how', 'why',
       'when', 'where', 'can', 'you', 'give', 'me', 'tell', 'about', 'and', 'or', 'in', 'on',
-      'at', 'to', 'for', 'of', 'with', 'by', 'from', 'explain', 'describe', 'define'
+      'at', 'to', 'for', 'of', 'with', 'by', 'from', 'explain', 'describe', 'define',
     ]);
     const queryTokens = (queryText.toLowerCase().match(/[a-z0-9_#$+-]+/g) || []).filter(
       (w) => w.length > 1 && !stopWords.has(w)
     );
 
-    this.entries.forEach((entry) => {
-      // Strict access control & notebook scoping — never cross notebook/user boundaries
-      if (entry.userId !== userId) {
-        return;
-      }
-      if (notebookId && entry.notebookId !== notebookId) {
-        return;
-      }
-      if (documentId && entry.documentId !== documentId) {
-        return;
+    const candidates: Array<{ chunk: DocumentChunk; score: number }> = [];
+
+    for (const row of res.rows) {
+      // Double-verify isolation boundaries
+      if (row.user_id !== userId || row.notebook_id !== effectiveNotebookId) {
+        continue;
       }
 
-      // 1. Calculate dense vector cosine similarity via dot product
-      let dotProduct = 0;
-      const v = entry.vector;
-      const len = Math.min(queryVector.length, v.length);
-      for (let i = 0; i < len; i++) {
-        dotProduct += queryVector[i] * v[i];
-      }
-      const semanticScore = Math.max(0, Math.min(1, (dotProduct + 1) / 2));
+      const rawCosine = Number.isFinite(row.cosine_similarity) ? row.cosine_similarity : 0;
+      const semanticScore = Math.max(0, Math.min(1, (rawCosine + 1) / 2));
 
-      // 2. Calculate lexical keyword matching score (BM25-style overlap)
       let lexicalScore = 0;
       if (queryTokens.length > 0) {
-        const textLower = (entry.text || '').toLowerCase();
-        const headingLower = (entry.metadata.heading || '').toLowerCase();
-        const sectionLower = (entry.metadata.section || '').toLowerCase();
+        const textLower = (row.text || '').toLowerCase();
+        const headingLower = (row.heading || '').toLowerCase();
+        const sectionLower = (row.section || '').toLowerCase();
 
         let matchedTokens = 0;
         let headingBonus = 0;
@@ -218,55 +131,52 @@ export class VectorStore {
         const tokenOverlapRatio = matchedTokens / queryTokens.length;
         lexicalScore = Math.min(1, tokenOverlapRatio + Math.min(0.3, headingBonus));
 
-        // Exact phrase bonus if query is 2+ words
         if (queryText.length > 4 && textLower.includes(queryText.toLowerCase())) {
           lexicalScore = Math.min(1, lexicalScore + 0.25);
         }
       }
 
-      // 3. Hybrid fusion: 65% dense semantic + 35% lexical keyword matching
-      const finalScore = queryTokens.length > 0
-        ? 0.65 * semanticScore + 0.35 * lexicalScore
-        : semanticScore;
+      const finalScore =
+        queryTokens.length > 0 ? 0.65 * semanticScore + 0.35 * lexicalScore : semanticScore;
 
-      candidates.push({ entry, score: finalScore });
-    });
+      candidates.push({
+        chunk: {
+          id: row.chunk_id,
+          documentId: row.document_id,
+          userId: row.user_id,
+          notebookId: row.notebook_id,
+          chunkIndex: Number(row.chunk_index || 0),
+          pageStart: Number(row.page_start || 1),
+          pageEnd: Number(row.page_end || 1),
+          section: row.section || '',
+          heading: row.heading || '',
+          text: row.text,
+          tokenEstimate: Number(row.token_estimate || Math.ceil((row.text || '').length / 4)),
+          extractionMethod: row.extraction_method === 'ocr' ? 'ocr' : 'text',
+          sourceDocName: row.source_doc_name,
+        },
+        score: finalScore,
+      });
+    }
 
     if (candidates.length === 0) {
       return [];
     }
 
-    // Rank descending by similarity score
     candidates.sort((a, b) => b.score - a.score);
-
-    // Filter by similarity threshold
     const filtered = candidates.filter((c) => c.score >= threshold);
-
-    // Take top-K results within this notebook only
-    const topResults = (filtered.length > 0 ? filtered : candidates.slice(0, Math.min(topK, candidates.length))).slice(0, topK);
+    const topResults = (
+      filtered.length > 0 ? filtered : candidates.slice(0, Math.min(topK, candidates.length))
+    ).slice(0, topK);
 
     return topResults.map((c) => ({
-      chunk: {
-        id: c.entry.id,
-        documentId: c.entry.documentId,
-        userId: c.entry.userId,
-        notebookId: c.entry.notebookId,
-        chunkIndex: 0,
-        pageStart: c.entry.metadata.pageStart,
-        pageEnd: c.entry.metadata.pageEnd,
-        section: c.entry.metadata.section,
-        heading: c.entry.metadata.heading,
-        text: c.entry.text,
-        tokenEstimate: Math.ceil(c.entry.text.length / 4),
-        extractionMethod: c.entry.metadata.extractionMethod,
-        sourceDocName: c.entry.metadata.sourceDocName,
-      },
+      chunk: c.chunk,
       score: Math.round(c.score * 100) / 100,
     }));
   }
 
-  getEntryCount(): number {
-    return this.entries.size;
+  async getEntryCount(userId: string): Promise<number> {
+    return db.getVectorCountForUser(userId);
   }
 }
 

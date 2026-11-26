@@ -1,5 +1,6 @@
 import { db } from '../db/database';
 import { DocumentMetrics } from '../db/models';
+import { storageService } from '../services/storageService';
 import { pdfExtractor } from '../services/pdfExtractor';
 import { textCleaner } from '../services/textCleaner';
 import { structureDetector } from '../services/structureDetector';
@@ -10,42 +11,47 @@ import { vectorStore } from '../services/vectorStore';
 
 export class DocumentProcessor {
   /**
-   * Asynchronous background ingestion pipeline.
-   * Requirement #1, #4, #19, #20, #43:
-   * Non-blocking background worker that progresses through all pipeline stages,
-   * updates the database with live metrics, and handles errors safely.
+   * Persistent, idempotent document ingestion pipeline.
+   * Atomically claims a QUEUED/FAILED job in `processing_jobs`, downloads the file from
+   * private Supabase Storage, extracts & chunks pages, generates 128-dim embeddings,
+   * and atomically upserts chunks + pgvector embeddings inside a PostgreSQL transaction.
    */
-  async processDocument(documentId: string): Promise<void> {
+  async processDocument(documentId: string): Promise<{ processed: boolean; status: string }> {
     const startTime = Date.now();
 
-    const doc = db.getDocument(documentId);
+    const doc = await db.getDocument(documentId);
     if (!doc) {
-      console.error(`Document ${documentId} not found in database.`);
-      return;
+      console.error(`[DocumentProcessor] Document ${documentId} not found in database.`);
+      return { processed: false, status: 'NOT_FOUND' };
+    }
+
+    const claimedJob = await db.claimProcessingJob(documentId);
+    if (!claimedJob) {
+      // Either another worker already claimed/is running this job, or it already completed
+      console.log(`[DocumentProcessor] Job for ${documentId} already running or completed; skipping duplicate run.`);
+      return { processed: false, status: doc.status };
     }
 
     try {
-      // 1. Stage: PROCESSING
-      db.updateDocument(documentId, {
+      await db.updateDocument(documentId, {
         status: 'PROCESSING',
         currentStage: 'Initializing ingestion pipeline',
         progress: 25,
-        message: 'Validating file integrity and preparing background worker...',
+        message: 'Downloading document from private storage and initializing pipeline...',
+        error: null,
       });
 
-      // Small async delay so UI observes genuine stage transition
-      await new Promise((r) => setTimeout(r, 400));
+      const fileBuffer = await storageService.downloadBuffer(doc.storagePath);
 
-      // 2. Stage: EXTRACTING (Page-by-page extraction)
       const extractStart = Date.now();
-      db.updateDocument(documentId, {
+      await db.updateDocument(documentId, {
         status: 'EXTRACTING',
         currentStage: 'Page-by-page text extraction',
         progress: 35,
         message: 'Parsing document structure and extracting text per page...',
       });
 
-      const extractedPages = await pdfExtractor.extractPages(doc.storagePath, doc.originalFileName);
+      const extractedPages = await pdfExtractor.extractPagesFromBuffer(fileBuffer, doc.originalFileName);
       const extractDuration = Date.now() - extractStart;
       const totalPages = extractedPages.length || 1;
       const ocrPages = extractedPages.filter((p) => p.extractionMethod === 'ocr');
@@ -55,9 +61,8 @@ export class DocumentProcessor {
         totalExtractedChars += p.charCount;
       });
 
-      // 3. Stage: OCR (if any page needed OCR)
       if (ocrPages.length > 0) {
-        db.updateDocument(documentId, {
+        await db.updateDocument(documentId, {
           status: 'OCR',
           currentStage: `Optical Character Recognition (${ocrPages.length} scanned pages)`,
           progress: 50,
@@ -65,11 +70,9 @@ export class DocumentProcessor {
           processedPages: totalPages,
           totalPages,
         });
-        await new Promise((r) => setTimeout(r, 450));
       }
 
-      // 4. Stage: CLEANING
-      db.updateDocument(documentId, {
+      await db.updateDocument(documentId, {
         status: 'CLEANING',
         currentStage: 'Text normalization & artifact removal',
         progress: 60,
@@ -89,10 +92,7 @@ export class DocumentProcessor {
         };
       });
 
-      await new Promise((r) => setTimeout(r, 350));
-
-      // 5. Stage: CHUNKING
-      db.updateDocument(documentId, {
+      await db.updateDocument(documentId, {
         status: 'CHUNKING',
         currentStage: 'Structure-aware semantic chunking',
         progress: 72,
@@ -107,55 +107,39 @@ export class DocumentProcessor {
         cleanedPages
       );
 
-      // Validate chunks
       const validation = chunkValidator.validateChunks(rawChunks);
       const validChunks = validation.validChunks;
 
       if (validChunks.length === 0) {
-        throw new Error('Document processing yielded zero valid text chunks. The document may be empty or unreadable.');
+        throw new Error(
+          'Document processing yielded zero valid text chunks. The document may be empty or unreadable.'
+        );
       }
 
-      // Save relational chunks to DB
-      db.saveDocumentChunks(documentId, validChunks);
-
-      db.updateDocument(documentId, {
-        chunkCount: validChunks.length,
-      });
-
-      await new Promise((r) => setTimeout(r, 350));
-
-      // 6. Stage: EMBEDDING
-      db.updateDocument(documentId, {
+      await db.updateDocument(documentId, {
         status: 'EMBEDDING',
         currentStage: `Generating vector embeddings (${validChunks.length} chunks)`,
         progress: 85,
         message: `Computing 128-dimensional dense semantic embeddings for ${validChunks.length} chunks...`,
+        chunkCount: validChunks.length,
       });
 
       const chunkTexts = validChunks.map((c) => c.text);
       const vectors = await embeddingService.embedChunks(chunkTexts);
 
-      await new Promise((r) => setTimeout(r, 350));
-
-      // 7. Stage: INDEXING (ChromaDB / Local Vector Store)
       const indexStart = Date.now();
-      db.updateDocument(documentId, {
+      await db.updateDocument(documentId, {
         status: 'INDEXING',
-        currentStage: 'Vector database indexing',
+        currentStage: 'PostgreSQL pgvector indexing',
         progress: 94,
-        message: 'Upserting chunk embeddings and metadata into persistent vector database...',
+        message: 'Storing chunks and embeddings atomically in PostgreSQL pgvector...',
       });
 
-      // Clear existing vectors for this doc first (Idempotency requirement #21)
-      vectorStore.deleteByDocumentId(documentId);
-
-      // Upsert chunks and vectors
+      // Atomic transactional save of chunks + 128-dim embeddings
       await vectorStore.upsertChunks(validChunks, vectors);
       const indexingDuration = Date.now() - indexStart;
-
       const totalDuration = Date.now() - startTime;
 
-      // 8. Stage: COMPLETED
       const metrics: DocumentMetrics = {
         fileSize: doc.fileSize,
         pageCount: totalPages,
@@ -169,11 +153,11 @@ export class DocumentProcessor {
         totalDurationMs: totalDuration,
       };
 
-      db.updateDocument(documentId, {
+      await db.updateDocument(documentId, {
         status: 'COMPLETED',
         currentStage: 'Document Ingestion Complete',
         progress: 100,
-        message: `Successfully indexed ${validChunks.length} chunks across ${totalPages} pages into knowledge base.`,
+        message: `Successfully indexed ${validChunks.length} chunks across ${totalPages} pages into PostgreSQL pgvector.`,
         processedPages: totalPages,
         totalPages,
         chunkCount: validChunks.length,
@@ -181,18 +165,25 @@ export class DocumentProcessor {
         metrics,
       });
 
+      await db.completeProcessingJob(claimedJob.id);
+
       console.log(
-        `[Pipeline Complete] Document "${doc.originalFileName}" (${documentId}): ${totalPages} pages, ${validChunks.length} chunks, duration: ${totalDuration}ms`
+        `[Pipeline Complete] "${doc.originalFileName}" (${documentId}): ${totalPages} pages, ${validChunks.length} chunks, ${totalDuration}ms`
       );
+      return { processed: true, status: 'COMPLETED' };
     } catch (err: any) {
-      console.error(`Document ${documentId} ingestion failed:`, err);
-      // Requirement #20: Processing Failure handling
-      db.updateDocument(documentId, {
+      const errorMessage = err?.message || 'Unknown processing error occurred while extracting document.';
+      console.error(`[Pipeline Failed] Document ${documentId}:`, err);
+
+      await db.updateDocument(documentId, {
         status: 'FAILED',
         currentStage: 'Processing Failed',
         message: 'Ingestion pipeline encountered an error.',
-        error: err?.message || 'Unknown processing error occurred while extracting document.',
+        error: errorMessage,
       });
+
+      await db.failProcessingJob(claimedJob.id, errorMessage);
+      return { processed: false, status: 'FAILED' };
     }
   }
 }

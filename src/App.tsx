@@ -35,20 +35,57 @@ type AppView = 'landing' | 'auth' | 'dashboard' | 'workspace' | 'analytics' | 's
 
 export default function App() {
   // App state
+  const [isInitializingAuth, setIsInitializingAuth] = useState<boolean>(true);
   const [profile, setProfile] = useState<StudentProfile | null>(() => apiService.getProfile());
-  const [currentView, setCurrentView] = useState<AppView>(() => {
-    const prof = apiService.getProfile();
-    return prof ? 'dashboard' : 'auth';
-  });
+  const [currentView, setCurrentView] = useState<AppView>('auth');
   const [notebooks, setNotebooks] = useState<Notebook[]>(() => apiService.getNotebooks());
-  const [activeNotebookId, setActiveNotebookId] = useState<string>(() => {
-    const list = apiService.getNotebooks();
-    return list.length > 0 ? list[0].id : '';
-  });
+  const [activeNotebookId, setActiveNotebookId] = useState<string>('');
   const [recentActivity, setRecentActivity] = useState<RecentActivityItem[]>(() =>
     apiService.getRecentActivity()
   );
   const [analytics, setAnalytics] = useState<AnalyticsData>(() => apiService.getAnalytics());
+
+  useEffect(() => {
+    let mounted = true;
+    const syncStateFromService = (prof: StudentProfile | null) => {
+      if (!mounted) return;
+      setProfile(prof);
+      if (prof) {
+        const list = apiService.getNotebooks();
+        setNotebooks(list);
+        setActiveNotebookId((prev) =>
+          prev && list.some((n) => n.id === prev) ? prev : list[0]?.id || ''
+        );
+        setRecentActivity(apiService.getRecentActivity());
+        setAnalytics(apiService.getAnalytics());
+        setCurrentView((prev) => (prev === 'auth' || prev === 'landing' ? 'dashboard' : prev));
+      } else {
+        setNotebooks([]);
+        setActiveNotebookId('');
+        setRecentActivity([]);
+        setAnalytics(apiService.getAnalytics());
+        setCurrentView((prev) => (prev === 'landing' ? 'landing' : 'auth'));
+      }
+    };
+
+    apiService
+      .initializeSession()
+      .then((restoredProfile) => {
+        syncStateFromService(restoredProfile);
+      })
+      .finally(() => {
+        if (mounted) setIsInitializingAuth(false);
+      });
+
+    const unsubscribe = apiService.subscribeToAuthChanges((updatedProfile) => {
+      syncStateFromService(updatedProfile);
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, []);
 
   // Theme state
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -164,38 +201,39 @@ export default function App() {
   // Auth Handlers
   const handleAuthSuccess = (newProfile: StudentProfile) => {
     setProfile(newProfile);
-    const userNotebooks = apiService.getNotebooks(newProfile.id);
+    const userNotebooks = apiService.getNotebooks();
     setNotebooks(userNotebooks);
-    if (userNotebooks.length > 0) {
-      setActiveNotebookId(userNotebooks[0].id);
-    } else {
-      setActiveNotebookId('');
-    }
-    setRecentActivity(apiService.getRecentActivity(newProfile.id));
-    setAnalytics(apiService.getAnalytics(newProfile.id));
+    setActiveNotebookId(userNotebooks[0]?.id || '');
+    setRecentActivity(apiService.getRecentActivity());
+    setAnalytics(apiService.getAnalytics());
     setCurrentView('dashboard');
     showToast(`Welcome, ${newProfile.name}!`);
   };
 
-  const handleLogout = () => {
-    apiService.logout();
+  const handleLogout = async () => {
+    await apiService.logout();
     setProfile(null);
     setNotebooks([]);
     setActiveNotebookId('');
     setRecentActivity([]);
+    setAnalytics(apiService.getAnalytics());
     setAuthMode('login');
     setCurrentView('auth');
     showToast('Logged out successfully. Sign in anytime to access your dashboard.', 'info');
   };
 
   // Notebook creation
-  const handleCreateNotebook = (title: string, description: string, code?: string) => {
-    const newNb = apiService.createNotebook(title, description, code);
-    refreshNotebooks();
-    setActiveNotebookId(newNb.id);
-    setIsCreateNotebookOpen(false);
-    setCurrentView('workspace');
-    showToast(`Notebook "${title}" created successfully`);
+  const handleCreateNotebook = async (title: string, description: string, code?: string) => {
+    try {
+      const newNb = await apiService.createNotebook(title, description, code);
+      refreshNotebooks();
+      setActiveNotebookId(newNb.id);
+      setIsCreateNotebookOpen(false);
+      setCurrentView('workspace');
+      showToast(`Notebook "${title}" created successfully`);
+    } catch (err: any) {
+      showToast(err?.message || 'Failed to create notebook.', 'error');
+    }
   };
 
   // PDF Upload completed
@@ -208,9 +246,13 @@ export default function App() {
   // Document Delete
   const handleDeleteDocument = async (docId: string) => {
     if (!activeNotebook) return;
-    await apiService.deleteDocumentFromBackend(docId, activeNotebook.id);
-    refreshNotebooks();
-    showToast('Document removed from knowledge base', 'info');
+    try {
+      await apiService.deleteDocumentFromBackend(docId, activeNotebook.id);
+      refreshNotebooks();
+      showToast('Document removed from knowledge base', 'info');
+    } catch (err: any) {
+      showToast(err?.message || 'Failed to remove document.', 'error');
+    }
   };
 
   // Notebook Delete Prompt & Confirmation
@@ -225,14 +267,13 @@ export default function App() {
     setIsDeletingNotebook(true);
     try {
       const target = notebooks.find((nb) => nb.id === notebookId);
-      apiService.deleteNotebook(notebookId);
+      await apiService.deleteNotebook(notebookId);
 
       const updatedNotebooks = apiService.getNotebooks();
       setNotebooks(updatedNotebooks);
       setRecentActivity(apiService.getRecentActivity());
       setAnalytics(apiService.getAnalytics());
 
-      // If currently open notebook was deleted, switch to another notebook or back to dashboard
       if (activeNotebookId === notebookId) {
         if (updatedNotebooks.length > 0) {
           setActiveNotebookId(updatedNotebooks[0].id);
@@ -247,6 +288,8 @@ export default function App() {
         `Notebook "${target?.title || 'Course'}" and study data removed`,
         'info'
       );
+    } catch (err: any) {
+      showToast(err?.message || 'Failed to delete notebook.', 'error');
     } finally {
       setIsDeletingNotebook(false);
     }
@@ -262,9 +305,9 @@ export default function App() {
       setRecentActivity([]);
       setAnalytics(apiService.getAnalytics());
       setCurrentView('auth');
-      showToast('All login data, documents, and notebooks have been wiped.', 'info');
-    } catch {
-      showToast('Cleared local data.', 'info');
+      showToast('All account notebooks, documents, vectors, and exams have been wiped.', 'info');
+    } catch (err: any) {
+      showToast(err?.message || 'Failed to clear account data.', 'error');
     }
   };
 
@@ -294,26 +337,47 @@ export default function App() {
     setIsExamOpen(true);
   };
 
-  const handleSubmitExam = (answers: Record<number, number>, timeTakenSeconds: number) => {
+  const handleSubmitExam = async (answers: Record<number, number>, timeTakenSeconds: number) => {
     if (!activeNotebook) return;
-    const result = apiService.submitExam(
-      activeNotebook.id,
-      examQuestions,
-      answers,
-      timeTakenSeconds
-    );
-    setExamResult(result);
-    setIsExamOpen(false);
-    setIsExamResultOpen(true);
-    refreshNotebooks();
+    try {
+      const result = await apiService.submitExam(
+        activeNotebook.id,
+        examQuestions,
+        answers,
+        timeTakenSeconds
+      );
+      setExamResult(result);
+      setIsExamOpen(false);
+      setIsExamResultOpen(true);
+      refreshNotebooks();
+    } catch (err: any) {
+      showToast(err?.message || 'Failed to save exam result.', 'error');
+    }
   };
 
   // Profile update
-  const handleUpdateProfile = (updated: Partial<StudentProfile>) => {
-    const updatedProf = apiService.updateProfile(updated);
-    setProfile(updatedProf);
-    showToast('Profile settings saved');
+  const handleUpdateProfile = async (updated: Partial<StudentProfile>) => {
+    try {
+      const updatedProf = await apiService.updateProfile(updated);
+      setProfile(updatedProf);
+      showToast('Profile settings saved');
+    } catch (err: any) {
+      showToast(err?.message || 'Failed to save profile settings.', 'error');
+    }
   };
+
+  if (isInitializingAuth) {
+    return (
+      <div className="min-h-screen bg-[#F8FAFC] dark:bg-[#090D16] flex items-center justify-center p-6">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <div className="w-10 h-10 rounded-full border-3 border-blue-200 border-t-[#2563EB] animate-spin" />
+          <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+            Restoring your StudyAI session...
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   // If in landing mode
   if (currentView === 'landing') {
@@ -450,6 +514,7 @@ export default function App() {
               onOpenAnalytics={() => setCurrentView('analytics')}
               onDeleteDocument={handleDeleteDocument}
               onPreviewDocument={handlePreviewDocument}
+              onRefreshNotebooks={refreshNotebooks}
               onShowToast={showToast}
               onDeleteNotebook={handlePromptDeleteNotebook}
               onBackToNotebooks={() => setCurrentView('notebooks')}
@@ -478,10 +543,14 @@ export default function App() {
               activity={recentActivity}
               notebooks={notebooks}
               onOpenNotebook={handleOpenNotebook}
-              onClearRecent={() => {
-                apiService.clearRecentActivity();
-                setRecentActivity([]);
-                showToast('Recent activity timeline cleared', 'info');
+              onClearRecent={async () => {
+                try {
+                  await apiService.clearRecentActivity();
+                  setRecentActivity([]);
+                  showToast('Recent activity timeline cleared', 'info');
+                } catch (err: any) {
+                  showToast(err?.message || 'Failed to clear recent activity.', 'error');
+                }
               }}
               onStartExam={handleStartExam}
             />
@@ -517,19 +586,6 @@ export default function App() {
         notebookTitle={activeNotebook?.title || 'Notebook'}
         onClose={() => setIsPDFUploaderOpen(false)}
         onUploadComplete={handleUploadComplete}
-        onSuccess={(docData) => {
-          handleUploadComplete({
-            id: 'doc_' + Date.now(),
-            notebookId: activeNotebook?.id || '',
-            name: docData.name,
-            size: docData.size,
-            pages: docData.pages,
-            uploadDate: 'Just now',
-            status: 'ready',
-            extractedChunksCount: docData.pages * 4,
-            previewSnippet: `Preview of ${docData.name} - Extracted pages and indexed successfully into FAISS.`,
-          });
-        }}
       />
 
       {/* Upgraded Smart Summary Modal (Section A: Chat Summary & Section B: Per-PDF Summaries) */}

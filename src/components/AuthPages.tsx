@@ -11,6 +11,7 @@ import {
   AlertCircle,
   GraduationCap,
   Check,
+  Settings,
 } from 'lucide-react';
 import { StudentProfile } from '../types';
 import { apiService } from '../services/apiService';
@@ -59,17 +60,39 @@ export const AuthPages: React.FC<AuthPagesProps> = ({
   }>({});
 
   const [loading, setLoading] = useState(false);
+  const [verificationNotice, setVerificationNotice] = useState<string | null>(null);
   const [forgotModalOpen, setForgotModalOpen] = useState(false);
   const [forgotEmail, setForgotEmail] = useState('');
   const [forgotSuccess, setForgotSuccess] = useState(false);
+  const [forgotLoading, setForgotLoading] = useState(false);
+  const [forgotError, setForgotError] = useState<string | null>(null);
+  const [configStatus, setConfigStatus] = useState<{
+    clientConfigured: boolean;
+    serverConfigured: boolean;
+    missingClientVars: string[];
+    missingServerVars: string[];
+    databaseConnected: boolean;
+  } | null>(null);
 
-  // Load remembered email on mount or sync with initialMode
+  // Load remembered email on mount, sync with initialMode, and check Supabase configuration
   useEffect(() => {
     setIsLogin(initialMode === 'login');
     const savedEmail = apiService.getRememberedEmail();
     if (savedEmail) {
       setEmail(savedEmail);
     }
+
+    let active = true;
+    apiService
+      .getConfigurationStatus()
+      .then((status) => {
+        if (active) setConfigStatus(status);
+      })
+      .catch(() => {});
+
+    return () => {
+      active = false;
+    };
   }, [initialMode]);
 
   const notifySuccess = (profile: StudentProfile) => {
@@ -161,11 +184,11 @@ export const AuthPages: React.FC<AuthPagesProps> = ({
     setErrors(newErrors);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrors({});
+    setVerificationNotice(null);
 
-    // Validate all fields
     const newErrors: typeof errors = {};
 
     const emailErr = validateEmailFormat(email);
@@ -200,35 +223,27 @@ export const AuthPages: React.FC<AuthPagesProps> = ({
     }
 
     setLoading(true);
-
-    setTimeout(() => {
+    try {
       if (isLogin) {
-        // Authenticate existing credentials
-        const result = apiService.authenticateUser(email, password);
-        setLoading(false);
-
+        const result = await apiService.authenticateUser(email, password);
         if (!result.success || !result.profile) {
           setErrors({
             general: result.error || 'Authentication failed. Please check your credentials.',
           });
           return;
         }
-
-        // Save remembered email preference
         apiService.setRememberedEmail(email, rememberMe);
         notifySuccess(result.profile);
       } else {
-        // Register new account
-        const result = apiService.registerUser({
+        const result = await apiService.registerUser({
           name: name.trim(),
           email: email.trim(),
-          password: password.trim(),
+          password,
           degree,
           semester,
         });
-        setLoading(false);
 
-        if (!result.success || !result.profile) {
+        if (!result.success) {
           setErrors({
             general: result.error || 'Registration failed. Please try again.',
           });
@@ -236,9 +251,23 @@ export const AuthPages: React.FC<AuthPagesProps> = ({
         }
 
         apiService.setRememberedEmail(email, rememberMe);
-        notifySuccess(result.profile);
+
+        if (result.needsEmailVerification) {
+          setVerificationNotice(
+            result.message ||
+              'Account created! Please check your email and click the confirmation link to activate your account.'
+          );
+          setIsLogin(true);
+          return;
+        }
+
+        if (result.profile) {
+          notifySuccess(result.profile);
+        }
       }
-    }, 450);
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -298,6 +327,49 @@ export const AuthPages: React.FC<AuthPagesProps> = ({
               Create Account
             </button>
           </div>
+
+          {/* Missing Supabase Credentials Configuration Banner */}
+          {configStatus && (!configStatus.clientConfigured || !configStatus.serverConfigured) && (
+            <div
+              role="status"
+              data-testid="supabase-config-notice"
+              className="mb-5 p-3.5 rounded-xl bg-amber-50 border border-amber-200 flex items-start gap-2.5"
+            >
+              <Settings className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+              <div className="text-xs text-amber-950 leading-relaxed space-y-1.5">
+                <p className="font-semibold">Supabase Setup Required</p>
+                <p className="text-amber-900">
+                  Authentication, persistent notebooks, and private PDF storage require a free Supabase project configuration.
+                </p>
+                {configStatus.missingClientVars.length > 0 && (
+                  <p className="text-[11px] text-amber-900">
+                    <span className="font-semibold">Missing frontend variables:</span>{' '}
+                    <span className="font-mono">{configStatus.missingClientVars.join(', ')}</span>
+                  </p>
+                )}
+                {configStatus.missingServerVars.length > 0 && (
+                  <p className="text-[11px] text-amber-900">
+                    <span className="font-semibold">Missing server variables:</span>{' '}
+                    <span className="font-mono">{configStatus.missingServerVars.join(', ')}</span>
+                  </p>
+                )}
+                <p className="text-[11px] text-amber-800">
+                  Add your project credentials using <span className="font-mono">.env.example</span> and run{' '}
+                  <span className="font-mono">supabase/migrations/001_initial_schema.sql</span> in your Supabase SQL Editor.
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* Verification Notice Banner */}
+          {verificationNotice && (
+            <div className="mb-5 p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 flex items-start gap-2.5">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+              <div className="text-xs text-emerald-900 leading-relaxed">
+                <p className="font-semibold">{verificationNotice}</p>
+              </div>
+            </div>
+          )}
 
           {/* General Error Banner */}
           {errors.general && (
@@ -665,6 +737,9 @@ export const AuthPages: React.FC<AuthPagesProps> = ({
                 <p className="text-xs text-slate-600 mb-3 leading-relaxed">
                   Enter your student email address to receive password reset instructions.
                 </p>
+                {forgotError && (
+                  <p className="mb-2 text-[11px] text-rose-600 font-medium">{forgotError}</p>
+                )}
                 <div className="mb-4">
                   <input
                     type="email"
@@ -684,10 +759,21 @@ export const AuthPages: React.FC<AuthPagesProps> = ({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setForgotSuccess(true)}
-                    className="flex-1 py-2 text-xs font-semibold bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                    disabled={forgotLoading}
+                    onClick={async () => {
+                      setForgotError(null);
+                      setForgotLoading(true);
+                      const res = await apiService.requestPasswordReset(forgotEmail);
+                      setForgotLoading(false);
+                      if (res.success) {
+                        setForgotSuccess(true);
+                      } else {
+                        setForgotError(res.error || 'Could not send reset email.');
+                      }
+                    }}
+                    className="flex-1 py-2 text-xs font-semibold bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-60"
                   >
-                    Send Reset Link
+                    {forgotLoading ? 'Sending...' : 'Send Reset Link'}
                   </button>
                 </div>
               </div>

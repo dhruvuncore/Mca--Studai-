@@ -24,6 +24,32 @@ export interface DocumentMetrics {
   totalDurationMs: number;
 }
 
+export interface UserProfileRecord {
+  id: string;
+  email: string;
+  name: string;
+  avatar: string;
+  degree: string;
+  semester: string;
+  university: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface NotebookRecord {
+  id: string;
+  userId: string;
+  title: string;
+  code: string;
+  description: string;
+  iconName: string;
+  accentColor: string;
+  progress: number;
+  lastStudied: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface DocumentRecord {
   id: string;
   userId: string;
@@ -33,10 +59,11 @@ export interface DocumentRecord {
   storagePath: string;
   mimeType: string;
   fileSize: number;
+  fileHash?: string;
   uploadDate: string;
   status: DocumentStatus;
   currentStage: string;
-  progress: number; // 0 to 100
+  progress: number;
   message: string;
   processedPages: number;
   totalPages: number;
@@ -60,7 +87,7 @@ export interface CleanedPage {
 }
 
 export interface DocumentChunk {
-  id: string; // Deterministic: doc_xxx_chk_0001
+  id: string;
   documentId: string;
   userId: string;
   notebookId: string;
@@ -136,3 +163,73 @@ export interface ChatSummaryRecord {
   lastMessageId?: string;
 }
 
+export interface ChatMessageRecord {
+  id: string;
+  userId: string;
+  notebookId: string;
+  sender: 'user' | 'ai';
+  text: string;
+  timestamp: string;
+  sourceReferences?: Array<{
+    docName: string;
+    page: number;
+    pageEnd?: number;
+    section?: string;
+    snippet: string;
+    score?: number;
+  }>;
+  isGrounded?: boolean;
+  retrievalScore?: number;
+  insufficientInfo?: boolean;
+}
+
+export type ProcessingJobStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+
+export interface ProcessingJobRecord {
+  id: string;
+  documentId: string;
+  userId: string;
+  notebookId: string;
+  status: ProcessingJobStatus;
+  provider: 'qstash' | 'inline' | 'local';
+  qstashMessageId?: string | null;
+  attempts: number;
+  maxAttempts: number;
+  lastError?: string | null;
+  lockedAt?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface ExamResultRecord {
+  examId: string;
+  userId: string;
+  notebookId: string;
+  notebookTitle: string;
+  totalQuestions: number;
+  correctCount: number;
+  incorrectCount: number;
+  skippedCount: number;
+  percentage: number;
+  timeTakenSeconds: number;
+  topicPerformance: any[];
+  strongTopics: string[];
+  weakTopics: string[];
+  recommendation: string;
+  reviewQuestions: any[];
+  createdAt?: string;
+}
+
+export interface RecentActivityRecord {
+  id: string;
+  userId: string;
+  type: 'exam' | 'note' | 'document' | 'chat';
+  title: string;
+  subtitle: string;
+  timestamp: string;
+  score?: string;
+  notebookTitle: string;
+  createdAt?: string;
+}

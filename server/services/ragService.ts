@@ -26,7 +26,6 @@ export class RAGService {
       throw new Error('Valid notebookId is required.');
     }
 
-    // Handle simple greetings naturally without requiring indexed documents
     if (llmService.isGreeting(query)) {
       const greeting = llmService.generateGreetingResponse(undefined);
       return {
@@ -37,10 +36,10 @@ export class RAGService {
       };
     }
 
-    // Verify whether the selected notebook actually has indexed documents for this user
-    const notebookDocs = db
-      .getAllDocuments(userId, notebookId)
-      .filter((d) => d.status === 'COMPLETED' && (!documentId || d.id === documentId));
+    const allNotebookDocs = await db.getAllDocuments(userId, notebookId);
+    const notebookDocs = allNotebookDocs.filter(
+      (d) => d.status === 'COMPLETED' && (!documentId || d.id === documentId)
+    );
 
     if (notebookDocs.length === 0) {
       return {
@@ -56,13 +55,12 @@ export class RAGService {
 
     let targetDocName: string | undefined;
     if (documentId) {
-      const doc = db.getDocument(documentId);
+      const doc = await db.getDocument(documentId, userId);
       if (doc && doc.userId === userId && doc.notebookId === notebookId) {
         targetDocName = doc.originalFileName;
       }
     }
 
-    // 1. Follow-up query contextual enrichment for retrieval
     let retrievalQuery = query.trim();
     if (history && history.length > 0) {
       const isFollowUp =
@@ -78,7 +76,6 @@ export class RAGService {
       }
     }
 
-    // 2. Vector Retrieval strictly scoped to (userId, notebookId)
     const retrievedChunks = await retriever.retrieveRelevantChunks(retrievalQuery, {
       userId,
       documentId,
@@ -97,10 +94,8 @@ export class RAGService {
       };
     }
 
-    // 3. Build Structured Grounded Context
     const constructedContext = contextBuilder.buildContext(retrievedChunks);
 
-    // 4. Generate Grounded Gemini Tutor Response (throws AIServiceError if Gemini fails)
     const llmResponse = await llmService.generateGroundedAnswer({
       query: query.trim(),
       context: constructedContext,
@@ -108,7 +103,6 @@ export class RAGService {
       history,
     });
 
-    // 5. Format Clean Citations
     const sources = constructedContext.sourcesList.map((s) => ({
       docName: s.docName,
       pageStart: s.pageStart,

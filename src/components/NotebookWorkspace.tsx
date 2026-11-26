@@ -41,7 +41,8 @@ interface NotebookWorkspaceProps {
   onOpenAnalytics: () => void;
   onDeleteDocument: (docId: string) => void;
   onPreviewDocument: (doc: DocumentItem) => void;
-  onShowToast: (msg: string, type?: 'success' | 'info') => void;
+  onRefreshNotebooks?: () => void;
+  onShowToast: (msg: string, type?: 'success' | 'info' | 'error') => void;
   onDeleteNotebook?: (notebookId: string) => void;
   onBackToNotebooks?: () => void;
 }
@@ -55,6 +56,7 @@ export const NotebookWorkspace: React.FC<NotebookWorkspaceProps> = ({
   onOpenAnalytics,
   onDeleteDocument,
   onPreviewDocument,
+  onRefreshNotebooks,
   onShowToast,
   onDeleteNotebook,
   onBackToNotebooks,
@@ -64,6 +66,7 @@ export const NotebookWorkspace: React.FC<NotebookWorkspaceProps> = ({
   );
   const [inputValue, setInputValue] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  const [retryingDocId, setRetryingDocId] = useState<string | null>(null);
   const [chatError, setChatError] = useState<{
     message: string;
     retryable: boolean;
@@ -72,22 +75,43 @@ export const NotebookWorkspace: React.FC<NotebookWorkspaceProps> = ({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const chatBottomRef = useRef<HTMLDivElement>(null);
 
-  // Sync messages if notebook changes
+  // Sync messages from PostgreSQL backend when notebook changes
   useEffect(() => {
+    let active = true;
     setMessages(apiService.getChatMessages(notebook.id));
     setChatError(null);
+    apiService
+      .fetchChatMessages(notebook.id)
+      .then((serverMessages) => {
+        if (active) {
+          setMessages(serverMessages);
+        }
+      })
+      .catch((err) => {
+        console.warn('Could not load chat messages:', err);
+      });
+
+    return () => {
+      active = false;
+    };
   }, [notebook.id]);
 
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isTyping, chatError]);
 
-  const handleClearChat = () => {
-    apiService.clearChatMessages(notebook.id);
-    setMessages([]);
-    setChatError(null);
-    if (typeof onShowToast === 'function') {
-      onShowToast('Chat conversation cleared', 'info');
+  const handleClearChat = async () => {
+    try {
+      await apiService.clearChatMessages(notebook.id);
+      setMessages([]);
+      setChatError(null);
+      if (typeof onShowToast === 'function') {
+        onShowToast('Chat conversation cleared', 'info');
+      }
+    } catch (err: any) {
+      if (typeof onShowToast === 'function') {
+        onShowToast(err?.message || 'Failed to clear chat conversation', 'error');
+      }
     }
   };
 
@@ -117,7 +141,9 @@ export const NotebookWorkspace: React.FC<NotebookWorkspaceProps> = ({
 
       const finalMessages = [...baseMessages, aiMsg];
       setMessages(finalMessages);
-      apiService.saveChatMessages(notebook.id, finalMessages);
+      apiService.persistChatMessage(notebook.id, aiMsg).catch((saveErr) => {
+        console.warn('Could not persist AI chat message:', saveErr);
+      });
     } catch (err: any) {
       console.error('Error in sendRAGQuery:', err);
       setChatError({
@@ -146,10 +172,11 @@ export const NotebookWorkspace: React.FC<NotebookWorkspaceProps> = ({
       timestamp: nowStr,
     };
 
-    // Immediately display the user's question in chat and save to persistent storage
     const updatedWithUser = [...messages, userMsg];
     setMessages(updatedWithUser);
-    apiService.saveChatMessages(notebook.id, updatedWithUser);
+    apiService.persistChatMessage(notebook.id, userMsg).catch((saveErr) => {
+      console.warn('Could not persist user chat message:', saveErr);
+    });
     await executeQuery(trimmedQuery, updatedWithUser);
   };
 
@@ -232,60 +259,102 @@ export const NotebookWorkspace: React.FC<NotebookWorkspaceProps> = ({
               </div>
             ) : (
               <>
-                {notebook.documents.map((doc) => (
-                  <div
-                    key={doc.id}
-                    className="group relative flex cursor-pointer items-start gap-3 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] p-3 hover:border-[#2563EB] transition-all"
-                  >
-                    <div className="rounded bg-white p-1.5 shadow-xs shrink-0 text-[#2563EB]">
-                      <FileText className="w-4 h-4" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <p className="text-xs font-bold text-[#0F172A] truncate leading-tight">
-                        {doc.name}
-                      </p>
-                      <div className="mt-1 flex items-center justify-between text-[10px]">
-                        <span className="text-[#16A34A] font-medium">Ready to query ✓</span>
-                        <span className="text-[#64748B]">{doc.pages}p</span>
+                {notebook.documents.map((doc) => {
+                  const isFailed = doc.status === 'FAILED' || doc.status === 'error';
+                  const isReady = doc.status === 'COMPLETED' || doc.status === 'ready';
+                  const isRetrying = retryingDocId === doc.id;
+
+                  return (
+                    <div
+                      key={doc.id}
+                      className={`group relative flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-all ${
+                        isFailed
+                          ? 'border-rose-200 bg-rose-50/40 hover:border-rose-300'
+                          : 'border-[#E2E8F0] bg-[#F8FAFC] hover:border-[#2563EB]'
+                      }`}
+                    >
+                      <div className={`rounded bg-white p-1.5 shadow-xs shrink-0 ${isFailed ? 'text-rose-600' : 'text-[#2563EB]'}`}>
+                        <FileText className="w-4 h-4" />
                       </div>
-                      <div className="mt-2 pt-1 border-t border-[#E2E8F0]/60 flex items-center justify-between text-[10px] text-[#64748B]">
-                        <span>{doc.size}</span>
-                        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-bold text-[#0F172A] truncate leading-tight">
+                          {doc.name}
+                        </p>
+                        <div className="mt-1 flex items-center justify-between text-[10px]">
+                          {isFailed ? (
+                            <span className="text-rose-600 font-semibold">Processing failed</span>
+                          ) : isReady ? (
+                            <span className="text-[#16A34A] font-medium">Ready to query ✓</span>
+                          ) : (
+                            <span className="text-amber-600 font-medium flex items-center gap-1">
+                              <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                              <span>{doc.status}</span>
+                            </span>
+                          )}
+                          <span className="text-[#64748B]">{doc.pages}p</span>
+                        </div>
+                        {isFailed && (
                           <button
-                            onClick={(e) => {
+                            type="button"
+                            disabled={isRetrying}
+                            onClick={async (e) => {
                               e.stopPropagation();
-                              onOpenSmartNotes();
+                              setRetryingDocId(doc.id);
+                              try {
+                                await apiService.retryDocumentProcessing(doc.id, notebook.id);
+                                onRefreshNotebooks?.();
+                                onShowToast(`"${doc.name}" processed successfully`, 'success');
+                              } catch (retryErr: any) {
+                                onShowToast(retryErr?.message || 'Retry failed', 'error');
+                              } finally {
+                                setRetryingDocId(null);
+                              }
                             }}
-                            title="Open Smart Summary for this PDF"
-                            className="p-1 hover:text-emerald-600 rounded hover:bg-white transition-colors text-emerald-600"
+                            className="mt-1.5 inline-flex items-center gap-1 px-2 py-0.5 rounded bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-semibold disabled:opacity-60"
                           >
-                            <Sparkles className="w-3.5 h-3.5" />
+                            <RefreshCw className={`w-2.5 h-2.5 ${isRetrying ? 'animate-spin' : ''}`} />
+                            <span>{isRetrying ? 'Retrying...' : 'Retry Indexing'}</span>
                           </button>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onPreviewDocument(doc);
-                            }}
-                            title="Preview Chunks"
-                            className="p-1 hover:text-[#2563EB] rounded hover:bg-white transition-colors"
-                          >
-                            <Eye className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onDeleteDocument(doc.id);
-                            }}
-                            title="Remove Document"
-                            className="p-1 hover:text-rose-600 rounded hover:bg-white transition-colors"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                        )}
+                        <div className="mt-2 pt-1 border-t border-[#E2E8F0]/60 flex items-center justify-between text-[10px] text-[#64748B]">
+                          <span>{doc.size}</span>
+                          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onOpenSmartNotes();
+                              }}
+                              title="Open Smart Summary for this PDF"
+                              className="p-1 hover:text-emerald-600 rounded hover:bg-white transition-colors text-emerald-600"
+                            >
+                              <Sparkles className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onPreviewDocument(doc);
+                              }}
+                              title="Preview Chunks & Download"
+                              className="p-1 hover:text-[#2563EB] rounded hover:bg-white transition-colors"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onDeleteDocument(doc.id);
+                              }}
+                              title="Remove Document"
+                              className="p-1 hover:text-rose-600 rounded hover:bg-white transition-colors"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
 
                 {/* Upload More Box */}
                 <div
@@ -302,7 +371,7 @@ export const NotebookWorkspace: React.FC<NotebookWorkspaceProps> = ({
           {/* Left Footer Info */}
           <div className="p-3 border-t border-[#E2E8F0] bg-white text-[10px] text-[#64748B] flex items-center justify-between shrink-0">
             <span>Course: {notebook.code || 'MCA Unit'}</span>
-            <span className="font-semibold text-[#2563EB]">FAISS Indexed</span>
+            <span className="font-semibold text-[#2563EB]">pgvector Indexed</span>
           </div>
         </aside>
 
@@ -496,7 +565,7 @@ export const NotebookWorkspace: React.FC<NotebookWorkspaceProps> = ({
             {isTyping && (
               <div className="flex items-center gap-2 text-xs text-[#64748B] pl-11">
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-[#2563EB]" />
-                <span>Searching FAISS vector index & generating response...</span>
+                <span>Searching pgvector knowledge index & generating response...</span>
               </div>
             )}
 
